@@ -23,8 +23,8 @@ dependencies = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/openwurl/m3u8"
-Repository = "https://github.com/openwurl/m3u8"
+Homepage = "https://github.com/openwurl/openm3u8"
+Repository = "https://github.com/openwurl/openm3u8"
 
 [project.optional-dependencies]
 dev = [
