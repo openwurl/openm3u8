@@ -3,6 +3,7 @@
 # license that can be found in the LICENSE file.
 
 import itertools
+import os
 import re
 from datetime import datetime, timedelta
 
@@ -15,6 +16,18 @@ except ImportError:
 
 
 from m3u8 import protocol, version_matching
+
+# Check if the fast C parser should be used
+# Can be disabled by setting M3U8_USE_FAST_PARSER=0
+_USE_FAST_PARSER = os.environ.get("M3U8_USE_FAST_PARSER", "1") != "0"
+
+# Try to import the fast C parser
+_fast_parse = None
+if _USE_FAST_PARSER:
+    try:
+        from m3u8.cparser import parse as _fast_parse
+    except ImportError:
+        pass
 
 """
 http://tools.ietf.org/html/draft-pantos-http-live-streaming-08#section-3.2
@@ -42,8 +55,16 @@ class ParseError(Exception):
 
 def parse(content, strict=False, custom_tags_parser=None):
     """
-    Given a M3U8 playlist content returns a dictionary with all data found
+    Given a M3U8 playlist content returns a dictionary with all data found.
+
+    If the CFFI-based C parser is available and no custom_tags_parser is
+    provided, the fast C parser will be used for better performance.
+    Set the environment variable M3U8_USE_FAST_PARSER=0 to disable.
     """
+    # Use fast C parser when available and applicable
+    if _fast_parse is not None and not strict and custom_tags_parser is None:
+        return _fast_parse(content, strict=False, custom_tags_parser=None)
+
     data = {
         "media_sequence": 0,
         "is_variant": False,
