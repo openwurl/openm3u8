@@ -2,7 +2,6 @@
 # Modifications Copyright (c) 2026 Wurl.
 # Use of this source code is governed by a MIT License
 # license that can be found in the LICENSE file.
-import decimal
 import os
 
 from openm3u8.mixins import BasePathMixin, GroupedBasePathMixin
@@ -623,10 +622,8 @@ class Segment(BasePathMixin):
         if self.discontinuity:
             output.append("#EXT-X-DISCONTINUITY\n")
         if self.program_date_time:
-            output.append(
-                "#EXT-X-PROGRAM-DATE-TIME:%s\n"
-                % format_date_time(self.program_date_time, timespec=timespec)
-            )
+            dt_s = format_date_time(self.program_date_time, timespec=timespec)
+            output.append(f"#EXT-X-PROGRAM-DATE-TIME:{dt_s}\n")
 
         if len(self.dateranges):
             output.append(str(self.dateranges))
@@ -1177,10 +1174,9 @@ class StreamInfo:
             res = str(self.resolution[0]) + "x" + str(self.resolution[1])
             stream_inf.append("RESOLUTION=" + res)
         if self.frame_rate is not None:
-            stream_inf.append(
-                "FRAME-RATE=%g"
-                % decimal.Decimal(self.frame_rate).quantize(decimal.Decimal("1.000"))
-            )
+            # RFC 8216 says that FRAME-RATE should be "rounded to three decimal places."
+            fps = number_to_string(self.frame_rate, "0.3f")
+            stream_inf.append(f"FRAME-RATE={fps}")
         if self.codecs is not None:
             stream_inf.append("CODECS=" + quoted(self.codecs))
         if self.video_range is not None:
@@ -1683,12 +1679,10 @@ def quoted(string):
     return '"%s"' % string
 
 
-def number_to_string(number):
-    with decimal.localcontext() as ctx:
-        ctx.prec = 20  # set floating point precision
-        d = decimal.Decimal(str(number))
-        return str(
-            d.quantize(decimal.Decimal(1))
-            if d == d.to_integral_value()
-            else d.normalize()
-        )
+def number_to_string(number, fmt="0.6f"):
+    # Convert an `int` or `float` object to a string.
+    # `int`s and `float`s that would have `.is_integer()` evaluate to `True`
+    # come back with no trailing zeros or decimal point.
+    # `float`s that would have `.is_integer()` evaluate to `False` are rounded to
+    # six places after the decimal point, then have trailing zeros stripped.
+    return format(number, fmt).rstrip("0").rstrip(".")
