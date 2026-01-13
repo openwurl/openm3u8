@@ -1174,6 +1174,7 @@ class StreamInfo:
             res = str(self.resolution[0]) + "x" + str(self.resolution[1])
             stream_inf.append("RESOLUTION=" + res)
         if self.frame_rate is not None:
+            # RFC 8216 says that FRAME-RATE should be "rounded to three decimal places."
             fps = number_to_string(self.frame_rate, "0.3f")
             stream_inf.append(f"FRAME-RATE={fps}")
         if self.codecs is not None:
@@ -1679,4 +1680,9 @@ def quoted(string):
 
 
 def number_to_string(number, fmt="0.6f"):
+    # Convert an `int` or `float` object to a string.
+    # `int`s and `float`s that would have `.is_integer()` evaluate to `True`
+    # come back with no trailing zeros or decimal point.
+    # `float`s that would have `.is_integer()` evaluate to `False` are rounded to
+    # six places after the decimal point, then have trailing zeros stripped.
     return format(number, fmt).rstrip("0").rstrip(".")
