@@ -1039,7 +1039,9 @@ def test_segment_keys_with_multiple_keyformats():
     }
 
     # by_key should find segments containing a specific key
-    apple_key = next(k for k in obj.keys if k and k.keyformat == "com.apple.streamingkeydelivery")
+    apple_key = next(
+        k for k in obj.keys if k and k.keyformat == "com.apple.streamingkeydelivery"
+    )
     assert len(obj.segments.by_key(apple_key)) == 2
 
 
