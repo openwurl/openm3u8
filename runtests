@@ -18,6 +18,7 @@ function stop_server {
 
 function run {
     py.test -vv --cov-report term-missing --cov openm3u8 tests/
+    python tests/test_roundtrip_hashes.py
 }
 
 function main {
