@@ -113,7 +113,7 @@ def report_counts(
     items = [(tag, count) for tag, count in counter.items() if count >= min_count]
     items.sort(key=lambda item: (item[1], item[0]))
     if max_items > 0:
-        items = items[: max_items]
+        items = items[:max_items]
 
     for tag, count in items:
         print(f"{count:8d} {tag}")

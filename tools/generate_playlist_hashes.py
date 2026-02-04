@@ -5,13 +5,12 @@ from hashlib import sha256
 from pathlib import Path
 import sys
 
-repo_root = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(repo_root))
-
-from openm3u8 import loads as m3u8_loads
-
 
 def main() -> int:
+    repo_root = Path(__file__).resolve().parents[1]
+    sys.path.insert(0, str(repo_root))
+    from openm3u8 import loads as m3u8_loads
+
     origins_dir = repo_root / "tests" / "playlists"
     output_file = repo_root / "tests" / "playlist_hashes.txt"
 

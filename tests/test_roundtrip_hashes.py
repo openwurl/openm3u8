@@ -29,14 +29,14 @@ def test_roundtrip_hashes_match() -> None:
 
     actual_files = {path.name for path in playlist_files}
     expected_files = set(expected.keys())
-    assert (
-        actual_files == expected_files
-    ), "Playlist set does not match playlist_hashes.txt."
+    assert actual_files == expected_files, (
+        "Playlist set does not match playlist_hashes.txt."
+    )
 
     for playlist_path in playlist_files:
         original = playlist_path.read_text(errors="replace")
         dumped = m3u8_loads(original).dumps()
         digest = sha256(dumped.encode()).hexdigest()[:8]
-        assert (
-            digest == expected[playlist_path.name]
-        ), f"Hash mismatch for {playlist_path.name}."
+        assert digest == expected[playlist_path.name], (
+            f"Hash mismatch for {playlist_path.name}."
+        )
