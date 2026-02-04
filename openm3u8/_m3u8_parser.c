@@ -187,8 +187,11 @@ static inline PyObject *dict_get_interned(PyObject *dict, PyObject *interned_key
     X(str_title, "title") \
     X(str_expect_segment, "expect_segment") \
     X(str_expect_playlist, "expect_playlist") \
-    X(str_current_key, "current_key") \
+    X(str_current_keys, "current_keys") \
     X(str_keys, "keys") \
+    X(str_keyformat, "keyformat") \
+    X(str_identity, "identity") \
+    X(str_none_method, "NONE") \
     X(str_cue_out, "cue_out") \
     X(str_cue_in, "cue_in") \
     /* Segment/state keys */ \
@@ -745,6 +748,15 @@ init_parse_state(m3u8_state *mod_state)
     /* Use interned strings for commonly-accessed keys */
     if (dict_set_interned(state, mod_state->str_expect_segment, Py_False) < 0) goto fail;
     if (dict_set_interned(state, mod_state->str_expect_playlist, Py_False) < 0) goto fail;
+
+    /* Initialize current_keys as empty list */
+    PyObject *current_keys = PyList_New(0);
+    if (current_keys == NULL) goto fail;
+    if (dict_set_interned(state, mod_state->str_current_keys, current_keys) < 0) {
+        Py_DECREF(current_keys);
+        goto fail;
+    }
+    Py_DECREF(current_keys);
 
     return state;
 
@@ -1510,6 +1522,29 @@ parse_attrs_unquoted(const char *line, const char *tag)
     return result;
 }
 
+/*
+ * Helper: Compare two keyformat values for equality.
+ * NULL or missing keyformat is treated as "identity".
+ * Returns 1 if equal, 0 if not equal, -1 on error.
+ */
+static int
+keyformat_equal(m3u8_state *mod_state, PyObject *kf1, PyObject *kf2)
+{
+    /* Both NULL/missing -> both "identity" -> equal */
+    if (!kf1 && !kf2) return 1;
+
+    /* One NULL/missing -> compare with "identity" */
+    if (!kf1) {
+        return PyObject_RichCompareBool(mod_state->str_identity, kf2, Py_EQ);
+    }
+    if (!kf2) {
+        return PyObject_RichCompareBool(kf1, mod_state->str_identity, Py_EQ);
+    }
+
+    /* Both present -> compare directly */
+    return PyObject_RichCompareBool(kf1, kf2, Py_EQ);
+}
+
 /* Parse a key tag */
 static int
 parse_key(m3u8_state *mod_state, const char *line, PyObject *data, PyObject *state)
@@ -1517,10 +1552,48 @@ parse_key(m3u8_state *mod_state, const char *line, PyObject *data, PyObject *sta
     PyObject *key = parse_attrs_unquoted(line, EXT_X_KEY);
     if (!key) return -1;
 
-    /* Set current key in state */
-    if (dict_set_interned(state, mod_state->str_current_key, key) < 0) {
+    /* Get current_keys list from state */
+    PyObject *current_keys = dict_get_interned(state, mod_state->str_current_keys);
+    if (!current_keys) {
         Py_DECREF(key);
         return -1;
+    }
+
+    /* Get KEYFORMAT from the new key (defaults to "identity" if missing) */
+    /* Note: METHOD=NONE is handled like any other key - it replaces keys with
+     * the same KEYFORMAT. This distinguishes "explicitly unencrypted" from
+     * "never had a key". */
+    PyObject *new_keyformat = PyDict_GetItemString(key, "keyformat");  /* borrowed */
+
+    /* Look for existing key with same KEYFORMAT and replace it */
+    int replaced = 0;
+    Py_ssize_t n = PyList_Size(current_keys);
+    for (Py_ssize_t i = 0; i < n; i++) {
+        PyObject *existing = PyList_GetItem(current_keys, i);  /* borrowed */
+        PyObject *existing_keyformat = PyDict_GetItemString(existing, "keyformat");  /* borrowed */
+
+        int eq = keyformat_equal(mod_state, new_keyformat, existing_keyformat);
+        if (eq < 0) {
+            Py_DECREF(key);
+            return -1;
+        }
+        if (eq) {
+            /* Replace existing key with same KEYFORMAT */
+            if (PyList_SetItem(current_keys, i, Py_NewRef(key)) < 0) {
+                Py_DECREF(key);
+                return -1;
+            }
+            replaced = 1;
+            break;
+        }
+    }
+
+    /* If not replaced, append the new key */
+    if (!replaced) {
+        if (PyList_Append(current_keys, key) < 0) {
+            Py_DECREF(key);
+            return -1;
+        }
     }
 
     /* Add to keys list if not already present */
@@ -1774,13 +1847,21 @@ parse_ts_chunk(m3u8_state *mod_state, const char *line,
         return -1;
     }
 
-    /* Key - use interned string for current_key lookup */
-    PyObject *current_key = dict_get_interned(state, mod_state->str_current_key);
-    if (current_key) {
-        if (dict_set_interned(segment, mod_state->str_key, current_key) < 0) {
+    /* Keys - copy current_keys list to segment if non-empty */
+    PyObject *current_keys = dict_get_interned(state, mod_state->str_current_keys);
+    if (current_keys && PyList_Size(current_keys) > 0) {
+        /* Create a shallow copy of the list */
+        PyObject *keys_copy = PyList_GetSlice(current_keys, 0, PyList_Size(current_keys));
+        if (!keys_copy) {
             Py_DECREF(segment);
             return -1;
         }
+        if (dict_set_interned(segment, mod_state->str_keys, keys_copy) < 0) {
+            Py_DECREF(keys_copy);
+            Py_DECREF(segment);
+            return -1;
+        }
+        Py_DECREF(keys_copy);
     } else {
         /* For unencrypted segments, ensure None is in keys list */
         PyObject *keys = dict_get_interned(data, mod_state->str_keys);

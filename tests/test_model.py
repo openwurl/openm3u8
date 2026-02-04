@@ -1016,6 +1016,54 @@ def test_list_segments_by_key():
     assert "\n".join(output).strip() == expected.strip()
 
 
+def test_segment_keys_with_multiple_keyformats():
+    """
+    Test that segments with multiple EXT-X-KEY tags (different KEYFORMATs)
+    have all keys available via segment.keys, and segment.key returns the last one.
+    """
+    obj = m3u8.M3U8(playlists.PLAYLIST_WITH_MULTIPLE_KEYS_DIFFERENT_KEYFORMAT)
+
+    # First segment should have 3 keys
+    seg = obj.segments[0]
+    assert len(seg.keys) == 3
+
+    # segment.key should return the last key (backward compatibility)
+    assert seg.key.keyformat == "com.microsoft.playready"
+
+    # All keys should be accessible via segment.keys
+    keyformats = {k.keyformat for k in seg.keys}
+    assert keyformats == {
+        "com.apple.streamingkeydelivery",
+        "urn:uuid:edef8ba9-79d6-4ace-a3c8-27dcd51d21ed",
+        "com.microsoft.playready",
+    }
+
+    # by_key should find segments containing a specific key
+    apple_key = next(k for k in obj.keys if k and k.keyformat == "com.apple.streamingkeydelivery")
+    assert len(obj.segments.by_key(apple_key)) == 2
+
+
+def test_segment_keys_round_trip():
+    """
+    Test that a playlist with multiple keys per segment can be parsed and dumped
+    with all keys preserved.
+    """
+    obj = m3u8.M3U8(playlists.PLAYLIST_WITH_MULTIPLE_KEYS_DIFFERENT_KEYFORMAT)
+    output = obj.dumps()
+
+    # All 3 EXT-X-KEY tags should appear in the output
+    assert output.count("#EXT-X-KEY:") == 3
+
+    # Verify round-trip: parse the output and check keys are preserved
+    obj2 = m3u8.M3U8(output)
+    assert len(obj2.segments[0].keys) == 3
+    assert {k.keyformat for k in obj2.segments[0].keys} == {
+        "com.apple.streamingkeydelivery",
+        "urn:uuid:edef8ba9-79d6-4ace-a3c8-27dcd51d21ed",
+        "com.microsoft.playready",
+    }
+
+
 def test_replace_segment_key():
     obj = m3u8.M3U8(playlists.PLAYLIST_WITH_MULTIPLE_KEYS_UNENCRYPTED_AND_ENCRYPTED)
 

@@ -195,7 +195,7 @@ class M3U8:
             [
                 Segment(
                     base_uri=self.base_uri,
-                    keyobject=find_key(segment.get("key", {}), self.keys),
+                    keysobject=find_keys(segment.get("keys", []), self.keys),
                     **segment,
                 )
                 for segment in self.data.get("segments", [])
@@ -515,7 +515,13 @@ class Segment(BasePathMixin):
       byterange attribute from EXT-X-BYTERANGE parameter
 
     `key`
-      Key used to encrypt the segment (EXT-X-KEY)
+      The last Key used to encrypt the segment (EXT-X-KEY). This is the key
+      immediately preceding the media file. For backward compatibility.
+
+    `keys`
+      List of all Keys used to encrypt the segment (EXT-X-KEY). Multiple keys
+      with different KEYFORMAT attributes may apply to the same segment when
+      using Common Encryption. Returns an empty list when no keys are present.
 
     `parts`
       partial segments that make up this segment
@@ -548,13 +554,13 @@ class Segment(BasePathMixin):
         cue_out_explicitly_duration=False,
         cue_in=False,
         discontinuity=False,
-        key=None,
+        keys=None,
         scte35=None,
         oatcls_scte35=None,
         scte35_duration=None,
         scte35_elapsedtime=None,
         asset_metadata=None,
-        keyobject=None,
+        keysobject=None,
         parts=None,
         init_section=None,
         dateranges=None,
@@ -582,7 +588,7 @@ class Segment(BasePathMixin):
         self.scte35_duration = scte35_duration
         self.scte35_elapsedtime = scte35_elapsedtime
         self.asset_metadata = asset_metadata
-        self.key = keyobject
+        self.keys = keysobject if keysobject is not None else []
         self.parts = PartialSegmentList(
             [PartialSegment(base_uri=self._base_uri, **partial) for partial in parts]
             if parts
@@ -605,13 +611,11 @@ class Segment(BasePathMixin):
     def dumps(self, last_segment, timespec="milliseconds", infspec="auto"):
         output = []
 
-        if last_segment and self.key != last_segment.key:
-            output.append(str(self.key))
-            output.append("\n")
-        else:
-            # The key must be checked anyway now for the first segment
-            if self.key and last_segment is None:
-                output.append(str(self.key))
+        # Output keys if they differ from the previous segment
+        last_keys = last_segment.keys if last_segment else []
+        if self.keys != last_keys:
+            for key in self.keys:
+                output.append(str(key))
                 output.append("\n")
 
         if self.init_section:
@@ -734,6 +738,25 @@ class Segment(BasePathMixin):
         if self.init_section is not None:
             self.init_section.base_uri = newbase_uri
 
+    @property
+    def key(self):
+        """
+        Returns the last key in the keys list, or None if no keys are present.
+        This is the key immediately preceding the media file.
+        """
+        return self.keys[-1] if self.keys else None
+
+    @key.setter
+    def key(self, value):
+        """
+        Sets the segment's key, replacing all existing keys.
+        For backward compatibility with code that assigns segment.key directly.
+        """
+        if value is None:
+            self.keys = []
+        else:
+            self.keys = [value]
+
 
 class SegmentList(list, GroupedBasePathMixin):
     def dumps(self, timespec="milliseconds", infspec="auto"):
@@ -752,7 +775,9 @@ class SegmentList(list, GroupedBasePathMixin):
         return [seg.uri for seg in self]
 
     def by_key(self, key):
-        return [segment for segment in self if segment.key == key]
+        if key is None:
+            return [segment for segment in self if not segment.keys]
+        return [segment for segment in self if key in segment.keys]
 
 
 class PartialSegment(BasePathMixin):
@@ -1669,6 +1694,16 @@ def find_key(keydata, keylist):
             ):
                 return key
     raise KeyError("No key found for key data")
+
+
+def find_keys(keysdata, keylist):
+    """
+    Given a list of key data dicts, find the corresponding Key objects.
+    Returns a list of Key objects.
+    """
+    if not keysdata:
+        return []
+    return [find_key(keydata, keylist) for keydata in keysdata]
 
 
 def denormalize_attribute(attribute):
