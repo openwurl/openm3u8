@@ -1,0 +1,12 @@
+#EXTM3U
+#EXT-X-MEDIA:TYPE=SUBTITLES,GROUP-ID="Channel-TX--BO-HDott-US-virginia-1-W-HD-1-test-WY4yiK3_sub",NAME="Channel-TX--BO-HDott-US-virginia-1-W-HD-1-test-WY4yiK3_SPLIT_1_sub",URI="Channel-TX-BO-HDott-premium-virginia-1/Channel-TX--BO-HDott-US-virginia-1-W-HD-1-test-WY4yiK3_SPLIT_1_live_sub.m3u8"
+#EXT-X-STREAM-INF:BANDWIDTH=5280000,RESOLUTION=1920x1080,CODECS="avc1.4d4028,mp4a.40.2",SUBTITLES="Channel-TX--BO-HDott-US-virginia-1-W-HD-1-test-WY4yiK3_sub"
+Channel-TX-BO-HDott-premium-virginia-1/Channel-TX--BO-HDott-US-virginia-1-W-HD-1-test-WY4yiK3_live.m3u8
+#EXT-X-STREAM-INF:BANDWIDTH=3720000,RESOLUTION=1920x1080,CODECS="avc1.4d4028,mp4a.40.2",SUBTITLES="Channel-TX--BO-HDott-US-virginia-1-W-HD-1-test-WY4yiK3_sub"
+Channel-TX-BO-HDott-premium-virginia-1/Channel-TX--BO-HDott-US-virginia-1-W-HD-2-test-XZ4zuRz_live.m3u8
+#EXT-X-STREAM-INF:BANDWIDTH=2520000,RESOLUTION=960x540,CODECS="avc1.4d401f,mp4a.40.2",SUBTITLES="Channel-TX--BO-HDott-US-virginia-1-W-HD-1-test-WY4yiK3_sub"
+Channel-TX-BO-HDott-premium-virginia-1/Channel-TX--BO-HDott-US-virginia-1-W-SD-1-test-Y1gAuqx_live.m3u8
+#EXT-X-STREAM-INF:BANDWIDTH=1200000,RESOLUTION=640x360,CODECS="avc1.4d401e,mp4a.40.2",SUBTITLES="Channel-TX--BO-HDott-US-virginia-1-W-HD-1-test-WY4yiK3_sub"
+Channel-TX-BO-HDott-premium-virginia-1/Channel-TX--BO-HDott-US-virginia-1-W-SD-2-test-Z2jBuLZ_live.m3u8
+#EXT-X-STREAM-INF:BANDWIDTH=816000,RESOLUTION=384x216,CODECS="avc1.4d400d,mp4a.40.2",SUBTITLES="Channel-TX--BO-HDott-US-virginia-1-W-HD-1-test-WY4yiK3_sub"
+Channel-TX-BO-HDott-premium-virginia-1/Channel-TX--BO-HDott-US-virginia-1-W-SD-3-test-1XRlcoV_live.m3u8

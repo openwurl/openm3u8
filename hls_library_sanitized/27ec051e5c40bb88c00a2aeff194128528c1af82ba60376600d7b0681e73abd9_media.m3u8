@@ -1,0 +1,46 @@
+#EXTM3U
+#EXT-X-VERSION:3
+#EXT-X-TARGETDURATION:7
+#EXT-X-MEDIA-SEQUENCE:170268
+#EXT-X-DISCONTINUITY-SEQUENCE:5901
+#EXT-X-DISCONTINUITY
+#EXT-X-PROGRAM-DATE-TIME:2025-12-16T16:18:21.309Z
+#EXT-X-CUE-OUT:DURATION=90
+#EXTINF:5,{"title":"EXCLSUIVE ACCESS","iab":18,"keywords":[]}
+/vod/globalfashionchannel/a72d774f-64d0-4162-992c-cd0b4f4b33a3/seg_1080p0.ts
+#EXT-X-PROGRAM-DATE-TIME:2025-12-16T16:18:26.310Z
+#EXTINF:5,{"title":"EXCLSUIVE ACCESS","iab":18,"keywords":[]}
+/vod/globalfashionchannel/a72d774f-64d0-4162-992c-cd0b4f4b33a3/seg_1080p1.ts
+#EXT-X-PROGRAM-DATE-TIME:2025-12-16T16:18:31.305Z
+#EXTINF:5,{"title":"EXCLSUIVE ACCESS","iab":18,"keywords":[]}
+/vod/globalfashionchannel/a72d774f-64d0-4162-992c-cd0b4f4b33a3/seg_1080p2.ts
+#EXT-X-PROGRAM-DATE-TIME:2025-12-16T16:18:36.308Z
+#EXTINF:5,{"title":"EXCLSUIVE ACCESS","iab":18,"keywords":[]}
+/vod/globalfashionchannel/a72d774f-64d0-4162-992c-cd0b4f4b33a3/seg_1080p3.ts
+#EXT-X-PROGRAM-DATE-TIME:2025-12-16T16:18:41.306Z
+#EXTINF:5,{"title":"EXCLSUIVE ACCESS","iab":18,"keywords":[]}
+/vod/globalfashionchannel/a72d774f-64d0-4162-992c-cd0b4f4b33a3/seg_1080p4.ts
+#EXT-X-PROGRAM-DATE-TIME:2025-12-16T16:18:46.309Z
+#EXTINF:5,{"title":"EXCLSUIVE ACCESS","iab":18,"keywords":[]}
+/vod/globalfashionchannel/a72d774f-64d0-4162-992c-cd0b4f4b33a3/seg_1080p5.ts
+#EXT-X-PROGRAM-DATE-TIME:2025-12-16T16:18:51.309Z
+#EXTINF:5,{"title":"EXCLSUIVE ACCESS","iab":18,"keywords":[]}
+/vod/globalfashionchannel/a72d774f-64d0-4162-992c-cd0b4f4b33a3/seg_1080p6.ts
+#EXT-X-PROGRAM-DATE-TIME:2025-12-16T16:18:56.308Z
+#EXTINF:5,{"title":"EXCLSUIVE ACCESS","iab":18,"keywords":[]}
+/vod/globalfashionchannel/a72d774f-64d0-4162-992c-cd0b4f4b33a3/seg_1080p7.ts
+#EXT-X-PROGRAM-DATE-TIME:2025-12-16T16:19:01.309Z
+#EXTINF:5,{"title":"EXCLSUIVE ACCESS","iab":18,"keywords":[]}
+/vod/globalfashionchannel/a72d774f-64d0-4162-992c-cd0b4f4b33a3/seg_1080p8.ts
+#EXT-X-PROGRAM-DATE-TIME:2025-12-16T16:19:06.311Z
+#EXTINF:5,{"title":"EXCLSUIVE ACCESS","iab":18,"keywords":[]}
+/vod/globalfashionchannel/a72d774f-64d0-4162-992c-cd0b4f4b33a3/seg_1080p9.ts
+#EXT-X-PROGRAM-DATE-TIME:2025-12-16T16:19:11.310Z
+#EXTINF:5,{"title":"EXCLSUIVE ACCESS","iab":18,"keywords":[]}
+/vod/globalfashionchannel/a72d774f-64d0-4162-992c-cd0b4f4b33a3/seg_1080p10.ts
+#EXT-X-PROGRAM-DATE-TIME:2025-12-16T16:19:16.310Z
+#EXTINF:5,{"title":"EXCLSUIVE ACCESS","iab":18,"keywords":[]}
+/vod/globalfashionchannel/a72d774f-64d0-4162-992c-cd0b4f4b33a3/seg_1080p11.ts
+#EXT-X-PROGRAM-DATE-TIME:2025-12-16T16:19:21.310Z
+#EXTINF:5,{"title":"EXCLSUIVE ACCESS","iab":18,"keywords":[]}
+/vod/globalfashionchannel/a72d774f-64d0-4162-992c-cd0b4f4b33a3/seg_1080p12.ts

@@ -87,26 +87,45 @@ def sanitize_url(url: str) -> str:
     if not parsed.scheme or not parsed.netloc:
         return url
 
-    host = "example.com"
-    netloc = host
-    if parsed.port:
-        netloc = f"{host}:{parsed.port}"
+    host = parsed.hostname or ""
+    domain_parts = [part for part in host.split(".") if part]
+    if len(domain_parts) >= 2:
+        for index in range(len(domain_parts) - 1):
+            domain_parts[index] = hash_value(domain_parts[index], 8)
+    elif domain_parts:
+        domain_parts[0] = hash_value(domain_parts[0], 8)
+    new_host = ".".join(domain_parts)
 
-    segments = [seg for seg in parsed.path.split("/") if seg]
-    if not segments:
-        new_path = "/"
-    else:
-        new_segments: list[str] = []
-        for index, segment in enumerate(segments, start=1):
-            if index < len(segments):
-                new_segments.append(f"path{index}")
-            else:
-                ext = ""
-                if "." in segment:
-                    _, ext = segment.rsplit(".", 1)
-                    ext = "." + ext
-                new_segments.append(f"playlist_{len(segments)}{ext}")
-        new_path = "/" + "/".join(new_segments)
+    netloc = new_host
+    if parsed.port:
+        netloc = f"{new_host}:{parsed.port}"
+    if parsed.username:
+        user = hash_value(parsed.username, 8)
+        if parsed.password:
+            user = f"{user}:{hash_value(parsed.password, 8)}"
+        netloc = f"{user}@{netloc}"
+
+    segments = parsed.path.split("/")
+    start_index = 1 if segments and segments[0] == "" else 0
+    last_non_empty = -1
+    for index, segment in enumerate(segments):
+        if segment:
+            last_non_empty = index
+    for index in range(start_index, len(segments)):
+        segment = segments[index]
+        if not segment:
+            continue
+        if index < last_non_empty:
+            segments[index] = hash_value(segment, 8)
+            continue
+        name_parts = segment.split(".")
+        if len(name_parts) > 1:
+            for part_index in range(len(name_parts) - 1):
+                name_parts[part_index] = hash_value(name_parts[part_index], 8)
+            segments[index] = ".".join(name_parts)
+        else:
+            segments[index] = hash_value(segment, 8)
+    new_path = "/".join(segments) if segments else "/"
 
     new_query = build_sanitized_query(parsed.query)
     new_fragment = "frag1" if parsed.fragment else ""
