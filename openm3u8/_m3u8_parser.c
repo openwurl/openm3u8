@@ -26,7 +26,6 @@
  *
  * Error Handling:
  * - All Python C API calls that can fail are checked
- * - Helper macros (DICT_SET_AND_DECREF) ensure consistent cleanup
  * - ParseError exception is shared with the Python parser module
  *
  * Thread Safety:
@@ -112,19 +111,6 @@ Py_XNewRef(PyObject *obj)
  */
 static inline int dict_set_interned(PyObject *dict, PyObject *interned_key, PyObject *value);
 static inline PyObject *dict_get_interned(PyObject *dict, PyObject *interned_key);
-
-/*
- * Helper macro for setting dict items with proper error handling.
- * Decrefs value and returns/gotos on failure.
- */
-#define DICT_SET_AND_DECREF(dict, key, value, cleanup_label) \
-    do { \
-        if (PyDict_SetItemString((dict), (key), (value)) < 0) { \
-            Py_DECREF(value); \
-            goto cleanup_label; \
-        } \
-        Py_DECREF(value); \
-    } while (0)
 
 /* Protocol tag definitions - must match protocol.py */
 #define EXT_M3U "#EXTM3U"
@@ -319,6 +305,7 @@ typedef int (*TagHandler)(ParseContext *ctx, const char *line);
 typedef struct {
     const char *tag;      /* Tag string, e.g., "#EXTINF" */
     size_t tag_len;       /* Pre-computed length for fast prefix matching */
+    int requires_colon;   /* True if handler reads a value after TAG: */
     TagHandler handler;   /* Handler function */
 } TagDispatch;
 
@@ -760,20 +747,7 @@ fail:
 static PyObject *
 datetime_add_seconds(m3u8_state *state, PyObject *dt, double secs)
 {
-    PyObject *args = PyTuple_New(0);
-    if (args == NULL) {
-        return NULL;
-    }
-
-    PyObject *kwargs = Py_BuildValue("{s:d}", "seconds", secs);
-    if (kwargs == NULL) {
-        Py_DECREF(args);
-        return NULL;
-    }
-
-    PyObject *delta = PyObject_Call(state->timedelta_cls, args, kwargs);
-    Py_DECREF(kwargs);
-    Py_DECREF(args);
+    PyObject *delta = PyObject_CallFunction(state->timedelta_cls, "id", 0, secs);
     if (delta == NULL) {
         return NULL;
     }
@@ -1785,8 +1759,17 @@ parse_ts_chunk(m3u8_state *mod_state, const char *line,
         /* For unencrypted segments, ensure None is in keys list */
         PyObject *keys = dict_get_interned(data, mod_state->str_keys);
         if (keys) {
+            if (!PyList_Check(keys)) {
+                PyErr_SetString(PyExc_TypeError, "data['keys'] must be a list");
+                Py_DECREF(segment);
+                return -1;
+            }
             int has_none = 0;
             Py_ssize_t n = PyList_Size(keys);
+            if (n < 0) {
+                Py_DECREF(segment);
+                return -1;
+            }
             for (Py_ssize_t i = 0; i < n; i++) {
                 if (PyList_GetItem(keys, i) == Py_None) {
                     has_none = 1;
@@ -1794,7 +1777,10 @@ parse_ts_chunk(m3u8_state *mod_state, const char *line,
                 }
             }
             if (!has_none) {
-                PyList_Append(keys, Py_None);
+                if (PyList_Append(keys, Py_None) < 0) {
+                    Py_DECREF(segment);
+                    return -1;
+                }
             }
         }
     }
@@ -2289,11 +2275,29 @@ handle_stream_inf_with_uri(ParseContext *ctx, const char *line, const char *tag,
         return -1;
     }
 
-    /* info_key passed as char* - Py_BuildValue "s" is fine for rare keys */
-    PyObject *playlist = Py_BuildValue("{s:N,s:N}", "uri", uri, info_key, info);
-    if (playlist == NULL) return -1;
+    PyObject *playlist = PyDict_New();
+    if (playlist == NULL) {
+        Py_DECREF(uri);
+        Py_DECREF(info);
+        return -1;
+    }
+
+    if (dict_set_interned(playlist, ms->str_uri, uri) < 0 ||
+        PyDict_SetItemString(playlist, info_key, info) < 0) {
+        Py_DECREF(playlist);
+        Py_DECREF(uri);
+        Py_DECREF(info);
+        return -1;
+    }
+    Py_DECREF(uri);
+    Py_DECREF(info);
 
     PyObject *list = dict_get_interned(ctx->data, list_key);
+    if (list == NULL || !PyList_Check(list)) {
+        PyErr_SetString(PyExc_TypeError, "playlist target must be a list");
+        Py_DECREF(playlist);
+        return -1;
+    }
     int rc = PyList_Append(list, playlist);
     Py_DECREF(playlist);
     return rc;
@@ -2561,57 +2565,63 @@ handle_blackout(ParseContext *ctx, const char *line)
  *
  * Note: sizeof(TAG)-1 gives strlen at compile time (excluding null terminator).
  */
+#define VALUE_TAG(tag, handler) {tag, sizeof(tag)-1, 1, handler}
+#define BARE_TAG(tag, handler)  {tag, sizeof(tag)-1, 0, handler}
+
 static const TagDispatch TAG_DISPATCH[] = {
     /* High-frequency tags first */
-    {EXTINF,                      sizeof(EXTINF)-1,                      handle_extinf},
-    {EXT_X_KEY,                   sizeof(EXT_X_KEY)-1,                   handle_key},
-    {EXT_X_BYTERANGE,             sizeof(EXT_X_BYTERANGE)-1,             handle_byterange},
-    {EXT_X_PROGRAM_DATE_TIME,     sizeof(EXT_X_PROGRAM_DATE_TIME)-1,     handle_program_date_time},
-    {EXT_X_DISCONTINUITY,         sizeof(EXT_X_DISCONTINUITY)-1,         handle_discontinuity},
-    {EXT_X_MAP,                   sizeof(EXT_X_MAP)-1,                   handle_map},
-    {EXT_X_PART,                  sizeof(EXT_X_PART)-1,                  handle_part},
-    {EXT_X_BITRATE,               sizeof(EXT_X_BITRATE)-1,               handle_bitrate},
-    {EXT_X_GAP,                   sizeof(EXT_X_GAP)-1,                   handle_gap},
-    {EXT_X_DATERANGE,             sizeof(EXT_X_DATERANGE)-1,             handle_daterange},
+    VALUE_TAG(EXTINF,                      handle_extinf),
+    VALUE_TAG(EXT_X_KEY,                   handle_key),
+    VALUE_TAG(EXT_X_BYTERANGE,             handle_byterange),
+    VALUE_TAG(EXT_X_PROGRAM_DATE_TIME,     handle_program_date_time),
+    BARE_TAG(EXT_X_DISCONTINUITY,          handle_discontinuity),
+    VALUE_TAG(EXT_X_MAP,                   handle_map),
+    VALUE_TAG(EXT_X_PART,                  handle_part),
+    VALUE_TAG(EXT_X_BITRATE,               handle_bitrate),
+    BARE_TAG(EXT_X_GAP,                    handle_gap),
+    VALUE_TAG(EXT_X_DATERANGE,             handle_daterange),
     /* Variant playlist tags */
-    {EXT_X_STREAM_INF,            sizeof(EXT_X_STREAM_INF)-1,            handle_stream_inf},
-    {EXT_X_MEDIA,                 sizeof(EXT_X_MEDIA)-1,                 handle_media},
-    {EXT_X_I_FRAME_STREAM_INF,    sizeof(EXT_X_I_FRAME_STREAM_INF)-1,    handle_i_frame_stream_inf},
-    {EXT_X_IMAGE_STREAM_INF,      sizeof(EXT_X_IMAGE_STREAM_INF)-1,      handle_image_stream_inf},
-    {EXT_X_SESSION_DATA,          sizeof(EXT_X_SESSION_DATA)-1,          handle_session_data},
-    {EXT_X_SESSION_KEY,           sizeof(EXT_X_SESSION_KEY)-1,           handle_session_key},
-    {EXT_X_CONTENT_STEERING,      sizeof(EXT_X_CONTENT_STEERING)-1,      handle_content_steering},
+    VALUE_TAG(EXT_X_STREAM_INF,            handle_stream_inf),
+    VALUE_TAG(EXT_X_MEDIA,                 handle_media),
+    VALUE_TAG(EXT_X_I_FRAME_STREAM_INF,    handle_i_frame_stream_inf),
+    VALUE_TAG(EXT_X_IMAGE_STREAM_INF,      handle_image_stream_inf),
+    VALUE_TAG(EXT_X_SESSION_DATA,          handle_session_data),
+    VALUE_TAG(EXT_X_SESSION_KEY,           handle_session_key),
+    VALUE_TAG(EXT_X_CONTENT_STEERING,      handle_content_steering),
     /* Playlist metadata tags */
-    {EXT_X_TARGETDURATION,        sizeof(EXT_X_TARGETDURATION)-1,        handle_targetduration},
-    {EXT_X_MEDIA_SEQUENCE,        sizeof(EXT_X_MEDIA_SEQUENCE)-1,        handle_media_sequence},
-    {EXT_X_DISCONTINUITY_SEQUENCE,sizeof(EXT_X_DISCONTINUITY_SEQUENCE)-1,handle_discontinuity_sequence},
-    {EXT_X_PLAYLIST_TYPE,         sizeof(EXT_X_PLAYLIST_TYPE)-1,         handle_playlist_type},
-    {EXT_X_VERSION,               sizeof(EXT_X_VERSION)-1,               handle_version},
-    {EXT_X_ALLOW_CACHE,           sizeof(EXT_X_ALLOW_CACHE)-1,           handle_allow_cache},
-    {EXT_X_ENDLIST,               sizeof(EXT_X_ENDLIST)-1,               handle_endlist},
-    {EXT_I_FRAMES_ONLY,           sizeof(EXT_I_FRAMES_ONLY)-1,           handle_i_frames_only},
-    {EXT_IS_INDEPENDENT_SEGMENTS, sizeof(EXT_IS_INDEPENDENT_SEGMENTS)-1, handle_independent_segments},
-    {EXT_X_IMAGES_ONLY,           sizeof(EXT_X_IMAGES_ONLY)-1,           handle_images_only},
+    VALUE_TAG(EXT_X_TARGETDURATION,        handle_targetduration),
+    VALUE_TAG(EXT_X_MEDIA_SEQUENCE,        handle_media_sequence),
+    VALUE_TAG(EXT_X_DISCONTINUITY_SEQUENCE,handle_discontinuity_sequence),
+    VALUE_TAG(EXT_X_PLAYLIST_TYPE,         handle_playlist_type),
+    VALUE_TAG(EXT_X_VERSION,               handle_version),
+    VALUE_TAG(EXT_X_ALLOW_CACHE,           handle_allow_cache),
+    BARE_TAG(EXT_X_ENDLIST,                handle_endlist),
+    BARE_TAG(EXT_I_FRAMES_ONLY,            handle_i_frames_only),
+    BARE_TAG(EXT_IS_INDEPENDENT_SEGMENTS,  handle_independent_segments),
+    BARE_TAG(EXT_X_IMAGES_ONLY,            handle_images_only),
     /* Low-latency HLS tags */
-    {EXT_X_SERVER_CONTROL,        sizeof(EXT_X_SERVER_CONTROL)-1,        handle_server_control},
-    {EXT_X_PART_INF,              sizeof(EXT_X_PART_INF)-1,              handle_part_inf},
-    {EXT_X_RENDITION_REPORT,      sizeof(EXT_X_RENDITION_REPORT)-1,      handle_rendition_report},
-    {EXT_X_SKIP,                  sizeof(EXT_X_SKIP)-1,                  handle_skip},
-    {EXT_X_PRELOAD_HINT,          sizeof(EXT_X_PRELOAD_HINT)-1,          handle_preload_hint},
+    VALUE_TAG(EXT_X_SERVER_CONTROL,        handle_server_control),
+    VALUE_TAG(EXT_X_PART_INF,              handle_part_inf),
+    VALUE_TAG(EXT_X_RENDITION_REPORT,      handle_rendition_report),
+    VALUE_TAG(EXT_X_SKIP,                  handle_skip),
+    VALUE_TAG(EXT_X_PRELOAD_HINT,          handle_preload_hint),
     /* SCTE-35 / Ad insertion tags */
-    {EXT_X_CUE_OUT_CONT,          sizeof(EXT_X_CUE_OUT_CONT)-1,          handle_cue_out_cont},
-    {EXT_X_CUE_OUT,               sizeof(EXT_X_CUE_OUT)-1,               handle_cue_out},
-    {EXT_X_CUE_IN,                sizeof(EXT_X_CUE_IN)-1,                handle_cue_in},
-    {EXT_X_CUE_SPAN,              sizeof(EXT_X_CUE_SPAN)-1,              handle_cue_span},
-    {EXT_OATCLS_SCTE35,           sizeof(EXT_OATCLS_SCTE35)-1,           handle_oatcls_scte35},
-    {EXT_X_ASSET,                 sizeof(EXT_X_ASSET)-1,                 handle_asset},
+    BARE_TAG(EXT_X_CUE_OUT_CONT,           handle_cue_out_cont),
+    BARE_TAG(EXT_X_CUE_OUT,                handle_cue_out),
+    BARE_TAG(EXT_X_CUE_IN,                 handle_cue_in),
+    BARE_TAG(EXT_X_CUE_SPAN,               handle_cue_span),
+    VALUE_TAG(EXT_OATCLS_SCTE35,           handle_oatcls_scte35),
+    VALUE_TAG(EXT_X_ASSET,                 handle_asset),
     /* Miscellaneous tags */
-    {EXT_X_START,                 sizeof(EXT_X_START)-1,                 handle_start},
-    {EXT_X_TILES,                 sizeof(EXT_X_TILES)-1,                 handle_tiles},
-    {EXT_X_BLACKOUT,              sizeof(EXT_X_BLACKOUT)-1,              handle_blackout},
+    VALUE_TAG(EXT_X_START,                 handle_start),
+    VALUE_TAG(EXT_X_TILES,                 handle_tiles),
+    BARE_TAG(EXT_X_BLACKOUT,               handle_blackout),
     /* Sentinel */
-    {NULL, 0, NULL}
+    {NULL, 0, 0, NULL}
 };
+
+#undef VALUE_TAG
+#undef BARE_TAG
 
 /*
  * Dispatch a tag to its handler using the dispatch table.
@@ -2634,9 +2644,9 @@ dispatch_tag(ParseContext *ctx, const char *line, size_t line_len)
         if (line_len < d->tag_len) continue;
 
         if (strncmp(line, d->tag, d->tag_len) == 0) {
-            /* Verify tag boundary: must end with ':' or be complete line */
+            /* Verify tag boundary and do not call value handlers on bare tags. */
             char next = line[d->tag_len];
-            if (next == ':' || next == '\0') {
+            if (next == ':' || (next == '\0' && !d->requires_colon)) {
                 if (d->handler(ctx, line) < 0) {
                     return -1;
                 }
@@ -2673,6 +2683,12 @@ m3u8_parse(PyObject *module, PyObject *args, PyObject *kwargs)
     /* Use s# to get pointer AND size directly from Python string object */
     if (!PyArg_ParseTupleAndKeywords(args, kwargs, "s#|pO", kwlist,
                                      &content, &content_len, &strict, &custom_tags_parser)) {
+        return NULL;
+    }
+
+    if (memchr(content, '\0', (size_t)content_len) != NULL) {
+        PyErr_SetString(PyExc_ValueError,
+                        "embedded null bytes are not supported by the C parser");
         return NULL;
     }
 

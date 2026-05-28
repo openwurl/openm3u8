@@ -105,3 +105,29 @@ def test_strict_version_matching_line_numbers_preserve_blank_lines():
 
     assert py_errors[0].line_number == c_errors[0].line_number
     assert py_errors[0].line == c_errors[0].line
+
+
+def test_bare_value_tags_do_not_read_stale_line_buffer():
+    version_result = c_parser.parse("XXXXXXXXXXXXXXX7\n#EXT-X-VERSION")
+    assert "version" not in version_result
+
+    extinf_result = c_parser.parse("ABCDEFGH42\n#EXTINF")
+    assert extinf_result["segments"] == []
+
+
+def test_custom_tags_parser_mutating_keys_fails_cleanly():
+    def custom_tags_parser(line, lineno, data, state):
+        if lineno == 1:
+            data["keys"] = ()
+        return False
+
+    with pytest.raises(TypeError):
+        c_parser.parse(
+            "#EXTM3U\n#EXTINF:1,\nfile.ts",
+            custom_tags_parser=custom_tags_parser,
+        )
+
+
+def test_embedded_nul_is_rejected_at_c_parser_boundary():
+    with pytest.raises(ValueError, match="embedded null bytes"):
+        c_parser.parse("#EXTM3U\n#EXT-X-VERSION:3\0#EXT-X-TARGETDURATION:8")
