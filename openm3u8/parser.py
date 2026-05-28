@@ -71,7 +71,7 @@ def parse(content, strict=False, custom_tags_parser=None):
     state = {
         "expect_segment": False,
         "expect_playlist": False,
-        "current_key": None,
+        "current_keys": [],
         "current_segment_map": None,
     }
 
@@ -145,7 +145,23 @@ def _parse_key(line, data, state, **kwargs):
         name, value = param.split("=", 1)
         key[normalize_attribute(name)] = remove_quotes(value)
 
-    state["current_key"] = key
+    # Per HLS spec: a key applies until the next key with the same KEYFORMAT
+    # (or "identity" if no KEYFORMAT). Replace any existing key with matching
+    # KEYFORMAT, or append if it's a new KEYFORMAT.
+    # METHOD=NONE also gets stored (to distinguish explicit unencrypted from
+    # never-encrypted), and it clears keys with the same KEYFORMAT.
+    new_keyformat = key.get("keyformat", "identity")
+
+    # Find and replace key with same KEYFORMAT, or append if not found
+    replaced = False
+    for i, existing in enumerate(state["current_keys"]):
+        if existing.get("keyformat", "identity") == new_keyformat:
+            state["current_keys"][i] = key
+            replaced = True
+            break
+    if not replaced:
+        state["current_keys"].append(key)
+
     if key not in data["keys"]:
         data["keys"].append(key)
 
@@ -190,8 +206,9 @@ def _parse_ts_chunk(line, data, state, **kwargs):
     segment["asset_metadata"] = scte_op("asset_metadata", None)
 
     segment["discontinuity"] = state.pop("discontinuity", False)
-    if state.get("current_key"):
-        segment["key"] = state["current_key"]
+    if state["current_keys"]:
+        # Copy the list so modifications don't affect previous segments
+        segment["keys"] = list(state["current_keys"])
     else:
         # For unencrypted segments, the initial key would be None
         if None not in data["keys"]:

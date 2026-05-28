@@ -84,11 +84,12 @@ def test_should_add_key_attribute_to_segment_from_playlist():
     data = m3u8.parse(
         playlists.PLAYLIST_WITH_ENCRYPTED_SEGMENTS_AND_IV_WITH_MULTIPLE_KEYS
     )
-    first_segment_key = data["segments"][0]["key"]
+    # Access the last key (most recently parsed) for each segment
+    first_segment_key = data["segments"][0]["keys"][-1]
     assert "/hls-key/key.bin" == first_segment_key["uri"]
     assert "AES-128" == first_segment_key["method"]
     assert "0X10ef8f758ca555115584bb5b3c687f52" == first_segment_key["iv"]
-    last_segment_key = data["segments"][-1]["key"]
+    last_segment_key = data["segments"][-1]["keys"][-1]
     assert "/hls-key/key2.bin" == last_segment_key["uri"]
     assert "AES-128" == last_segment_key["method"]
     assert "0Xcafe8f758ca555115584bb5b3c687f52" == last_segment_key["iv"]
@@ -96,14 +97,14 @@ def test_should_add_key_attribute_to_segment_from_playlist():
 
 def test_should_add_non_key_for_multiple_keys_unencrypted_and_encrypted():
     data = m3u8.parse(playlists.PLAYLIST_WITH_MULTIPLE_KEYS_UNENCRYPTED_AND_ENCRYPTED)
-    # First two segments have no Key, so it's not in the dictionary
-    assert "key" not in data["segments"][0]
-    assert "key" not in data["segments"][1]
-    third_segment_key = data["segments"][2]["key"]
+    # First two segments have no Key, so keys is not in the dictionary
+    assert "keys" not in data["segments"][0]
+    assert "keys" not in data["segments"][1]
+    third_segment_key = data["segments"][2]["keys"][-1]
     assert "/hls-key/key.bin" == third_segment_key["uri"]
     assert "AES-128" == third_segment_key["method"]
     assert "0X10ef8f758ca555115584bb5b3c687f52" == third_segment_key["iv"]
-    last_segment_key = data["segments"][-1]["key"]
+    last_segment_key = data["segments"][-1]["keys"][-1]
     assert "/hls-key/key2.bin" == last_segment_key["uri"]
     assert "AES-128" == last_segment_key["method"]
     assert "0Xcafe8f758ca555115584bb5b3c687f52" == last_segment_key["iv"]
@@ -113,13 +114,48 @@ def test_should_handle_key_method_none_and_no_uri_attr():
     data = m3u8.parse(
         playlists.PLAYLIST_WITH_MULTIPLE_KEYS_UNENCRYPTED_AND_ENCRYPTED_NONE_AND_NO_URI_ATTR
     )
-    assert "key" not in data["segments"][0]
-    assert "key" not in data["segments"][1]
-    third_segment_key = data["segments"][2]["key"]
+    assert "keys" not in data["segments"][0]
+    assert "keys" not in data["segments"][1]
+    third_segment_key = data["segments"][2]["keys"][-1]
     assert "/hls-key/key.bin" == third_segment_key["uri"]
     assert "AES-128" == third_segment_key["method"]
     assert "0X10ef8f758ca555115584bb5b3c687f52" == third_segment_key["iv"]
-    assert "NONE" == data["segments"][6]["key"]["method"]
+    assert "NONE" == data["segments"][6]["keys"][-1]["method"]
+
+
+def test_should_parse_multiple_keys_with_different_keyformat():
+    """
+    Test that multiple EXT-X-KEY tags with different KEYFORMAT attributes
+    are all associated with the same segment, as per the HLS spec for
+    Common Encryption support.
+    """
+    data = m3u8.parse(playlists.PLAYLIST_WITH_MULTIPLE_KEYS_DIFFERENT_KEYFORMAT)
+
+    # Should have 3 unique keys in the playlist
+    assert 3 == len(data["keys"])
+
+    # First segment should have all 3 keys
+    first_segment = data["segments"][0]
+    assert "keys" in first_segment
+    assert 3 == len(first_segment["keys"])
+
+    # Verify all three keys are present with correct KEYFORMAT
+    keyformats = {key["keyformat"] for key in first_segment["keys"]}
+    assert keyformats == {
+        "com.apple.streamingkeydelivery",
+        "urn:uuid:edef8ba9-79d6-4ace-a3c8-27dcd51d21ed",
+        "com.microsoft.playready",
+    }
+
+    # All keys should have the same METHOD and IV
+    for key in first_segment["keys"]:
+        assert "SAMPLE-AES" == key["method"]
+        assert "0xd7c3306f79c9b7d179f5dd09e2431d6e" == key["iv"]
+
+    # Second segment inherits the same keys (keys carry forward in HLS)
+    second_segment = data["segments"][1]
+    assert "keys" in second_segment
+    assert 3 == len(second_segment["keys"])
 
 
 def test_should_parse_playlist_with_session_encrypted_segments_from_string():
