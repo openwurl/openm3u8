@@ -642,7 +642,7 @@ class Segment(BasePathMixin):
             prefix = ":DURATION=" if self.cue_out_explicitly_duration else ":"
             cue_info = f"{prefix}{self.scte35_duration}" if self.scte35_duration else ""
             output.append(f"#EXT-X-CUE-OUT{cue_info}\n")
-            
+
             if self.cue_in:
                 output.append("#EXT-X-CUE-IN\n")
         elif self.cue_out:
