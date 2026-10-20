@@ -42,11 +42,11 @@ zip-safe = false
 
 [tool.cibuildwheel]
 build = [
-    "cp310-*",
     "cp311-*",
     "cp312-*",
     "cp313-*",
     "cp314-*",
+    "cp315-*",
 ]
 
 [tool.cibuildwheel.linux]
