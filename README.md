@@ -14,13 +14,13 @@ string, use the `load/loads` functions:
 ```python
 import openm3u8
 
-playlist = openm3u8.load('http://videoserver.com/playlist.m3u8')
+playlist = openm3u8.load("http://videoserver.com/playlist.m3u8")
 print(playlist.segments)
 print(playlist.target_duration)
 
 # if you already have the content as string, use
 
-playlist = openm3u8.loads('#EXTM3U8 ... etc ... ')
+playlist = openm3u8.loads("#EXTM3U8 ... etc ... ")
 ```
 
 ## Dumping a playlist
@@ -31,12 +31,12 @@ To dump a playlist from an object to the console or a file, use the
 ``` python
 import openm3u8
 
-playlist = openm3u8.load('http://videoserver.com/playlist.m3u8')
+playlist = openm3u8.load("http://videoserver.com/playlist.m3u8")
 print(playlist.dumps())
 
 # if you want to write a file from its content
 
-playlist.dump('playlist.m3u8')
+playlist.dump("playlist.m3u8")
 ```
 
 # Supported tags
