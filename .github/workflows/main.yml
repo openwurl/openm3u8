@@ -40,5 +40,5 @@ jobs:
       - name: Run all tests (no C extension)
         env:
           M3U8_NO_C_EXTENSION: "1"
-        run: ./runtests
+        run: make test
 
