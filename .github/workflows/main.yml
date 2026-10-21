@@ -36,7 +36,7 @@ jobs:
 
       # Runs a single command using the runners shell
       - name: Run all tests
-        run: ./runtests
+        run: make test
       - name: Run all tests (no C extension)
         env:
           M3U8_NO_C_EXTENSION: "1"
