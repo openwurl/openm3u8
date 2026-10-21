@@ -240,6 +240,17 @@ def test_segment_cue_out_in_dumps():
     assert expected in result
 
 
+def test_segment_cue_out_with_cue_in_dumps():
+    obj = m3u8.M3U8(playlists.CUE_OUT_CUE_IN_PLAYLIST)
+
+    assert obj.segments[0].cue_out_start is True
+    assert obj.segments[0].cue_in is True
+
+    result = obj.dumps()
+    expected = "#EXT-X-CUE-OUT:11.52\n#EXT-X-CUE-IN\n"
+    assert expected in result
+
+
 def test_segment_elemental_scte35_attribute():
     obj = m3u8.M3U8(playlists.CUE_OUT_ELEMENTAL_PLAYLIST)
     segments = obj.segments
