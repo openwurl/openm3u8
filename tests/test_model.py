@@ -226,6 +226,16 @@ class ModelTests(TestCase):
         expected = "#EXT-X-CUE-IN\n"
         self.assertIn(expected, result)
 
+    def test_segment_cue_out_with_cue_in_dumps(self):
+        obj = m3u8.M3U8(playlists.CUE_OUT_CUE_IN_PLAYLIST)
+
+        self.assertTrue(obj.segments[0].cue_out_start)
+        self.assertTrue(obj.segments[0].cue_in)
+
+        result = obj.dumps()
+        expected = "#EXT-X-CUE-OUT:11.52\n#EXT-X-CUE-IN\n"
+        self.assertIn(expected, result)
+
     def test_segment_elemental_scte35_attribute(self):
         obj = m3u8.M3U8(playlists.CUE_OUT_ELEMENTAL_PLAYLIST)
         segments = obj.segments
