@@ -84,7 +84,7 @@ playlist.dump("playlist.m3u8")
 # Running Tests
 
 ``` bash
-$ ./runtests
+make test
 ```
 
 # Contributing

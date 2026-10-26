@@ -18,20 +18,10 @@ classifiers = [
     "Operating System :: OS Independent",
     "Programming Language :: Python :: 3",
 ]
-dependencies = [
-    "backports-datetime-fromisoformat; python_version < '3.11'",
-]
 
 [project.urls]
 Homepage = "https://github.com/openwurl/openm3u8"
 Repository = "https://github.com/openwurl/openm3u8"
-
-[project.optional-dependencies]
-dev = [
-    "bottle",
-    "pytest>=9.0.1",
-    "pytest-cov>=7.0.0",
-]
 
 [tool.setuptools]
 packages = ["openm3u8"]
