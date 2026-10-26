@@ -3,16 +3,9 @@
 # Use of this source code is governed by a MIT License
 # license that can be found in the LICENSE file.
 
-import itertools
-import re
 from datetime import datetime, timedelta
-
-try:
-    from backports.datetime_fromisoformat import MonkeyPatch
-
-    MonkeyPatch.patch_fromisoformat()
-except ImportError:
-    pass
+from itertools import repeat
+from re import compile as re_compile
 
 
 from openm3u8 import protocol, version_matching
@@ -21,7 +14,7 @@ from openm3u8 import protocol, version_matching
 http://tools.ietf.org/html/draft-pantos-http-live-streaming-08#section-3.2
 http://stackoverflow.com/questions/2785755/how-to-split-but-ignore-separators-in-quoted-strings-in-python
 """
-ATTRIBUTELISTPATTERN = re.compile(r"""((?:[^,"']|"[^"]*"|'[^']*')+)""")
+ATTRIBUTELISTPATTERN = re_compile(r"""((?:[^,"']|"[^"]*"|'[^']*')+)""")
 
 
 def cast_date_time(value):
@@ -575,7 +568,7 @@ def string_to_lines(string):
 
 
 def remove_quotes_parser(*attrs):
-    return dict(zip(attrs, itertools.repeat(remove_quotes)))
+    return dict(zip(attrs, repeat(remove_quotes)))
 
 
 def remove_quotes(string):
