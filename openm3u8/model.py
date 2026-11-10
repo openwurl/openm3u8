@@ -183,112 +183,114 @@ class M3U8:
         self.base_path = base_path
 
     def _initialize_attributes(self):
-        self.keys = [
-            Key(base_uri=self.base_uri, **params) if params else None
-            for params in self.data.get("keys", [])
+        data = self.data
+        base_uri = self.base_uri
+
+        for attr, param in self.simple_attributes:
+            setattr(self, attr, data.get(param))
+
+        keys = [
+            Key(base_uri=base_uri, **params) if params else None
+            for params in data.get("keys", ())
         ]
+        self.keys = keys
+
         self.segment_map = [
-            InitializationSection(base_uri=self.base_uri, **params) if params else None
-            for params in self.data.get("segment_map", [])
+            InitializationSection(base_uri=base_uri, **params) if params else None
+            for params in data.get("segment_map", ())
         ]
+
+        from_parser = Segment._from_parser
         self.segments = SegmentList(
             [
-                Segment(
-                    base_uri=self.base_uri,
-                    keyobject=find_key(segment.get("key", {}), self.keys),
-                    **segment,
+                from_parser(
+                    segment,
+                    base_uri,
+                    find_key(segment["key"], keys) if "key" in segment else None,
+                    i,
                 )
-                for segment in self.data.get("segments", [])
+                for i, segment in enumerate(
+                    data.get("segments", ()), self.media_sequence or 0
+                )
             ]
         )
 
-        for attr, param in self.simple_attributes:
-            setattr(self, attr, self.data.get(param))
-
-        for i, segment in enumerate(self.segments, self.media_sequence or 0):
-            segment.media_sequence = i
-
-        self.files = []
-        for key in self.keys:
-            # Avoid None key, it could be the first one, don't repeat them
-            if key and key.uri not in self.files:
-                self.files.append(key.uri)
-        self.files.extend(self.segments.uri)
+        key_uris = dict.fromkeys(key.uri for key in keys if key)
+        self.files = [*key_uris, *self.segments.uri] if key_uris else self.segments.uri
 
         self.media = MediaList(
-            [
-                Media(base_uri=self.base_uri, **media)
-                for media in self.data.get("media", [])
-            ]
+            [Media(base_uri=base_uri, **media) for media in data.get("media", ())]
         )
 
         self.playlists = PlaylistList(
             [
-                Playlist(base_uri=self.base_uri, media=self.media, **playlist)
-                for playlist in self.data.get("playlists", [])
+                Playlist(base_uri=base_uri, media=self.media, **playlist)
+                for playlist in data.get("playlists", ())
             ]
         )
 
-        self.iframe_playlists = PlaylistList()
-        for ifr_pl in self.data.get("iframe_playlists", []):
-            self.iframe_playlists.append(
+        self.iframe_playlists = PlaylistList(
+            [
                 IFramePlaylist(
-                    base_uri=self.base_uri,
+                    base_uri=base_uri,
                     uri=ifr_pl["uri"],
                     iframe_stream_info=ifr_pl["iframe_stream_info"],
                 )
-            )
+                for ifr_pl in data.get("iframe_playlists", ())
+            ]
+        )
 
-        self.image_playlists = PlaylistList()
-        for img_pl in self.data.get("image_playlists", []):
-            self.image_playlists.append(
+        self.image_playlists = PlaylistList(
+            [
                 ImagePlaylist(
-                    base_uri=self.base_uri,
+                    base_uri=base_uri,
                     uri=img_pl["uri"],
                     image_stream_info=img_pl["image_stream_info"],
                 )
-            )
+                for img_pl in data.get("image_playlists", ())
+            ]
+        )
 
-        start = self.data.get("start", None)
+        start = data.get("start")
         self.start = start and Start(**start)
 
-        server_control = self.data.get("server_control", None)
+        server_control = data.get("server_control")
         self.server_control = server_control and ServerControl(**server_control)
 
-        part_inf = self.data.get("part_inf", None)
+        part_inf = data.get("part_inf")
         self.part_inf = part_inf and PartInformation(**part_inf)
 
-        skip = self.data.get("skip", None)
+        skip = data.get("skip")
         self.skip = skip and Skip(**skip)
 
         self.rendition_reports = RenditionReportList(
             [
-                RenditionReport(base_uri=self.base_uri, **rendition_report)
-                for rendition_report in self.data.get("rendition_reports", [])
+                RenditionReport(base_uri=base_uri, **rendition_report)
+                for rendition_report in data.get("rendition_reports", ())
             ]
         )
 
         self.session_data = SessionDataList(
             [
                 SessionData(**session_data)
-                for session_data in self.data.get("session_data", [])
+                for session_data in data.get("session_data", ())
                 if "data_id" in session_data
             ]
         )
 
         self.session_keys = [
-            SessionKey(base_uri=self.base_uri, **params) if params else None
-            for params in self.data.get("session_keys", [])
+            SessionKey(base_uri=base_uri, **params) if params else None
+            for params in data.get("session_keys", ())
         ]
 
-        preload_hint = self.data.get("preload_hint", None)
+        preload_hint = data.get("preload_hint")
         self.preload_hint = preload_hint and PreloadHint(
-            base_uri=self.base_uri, **preload_hint
+            base_uri=base_uri, **preload_hint
         )
 
-        content_steering = self.data.get("content_steering", None)
+        content_steering = data.get("content_steering")
         self.content_steering = content_steering and ContentSteering(
-            base_uri=self.base_uri, **content_steering
+            base_uri=base_uri, **content_steering
         )
 
     def __unicode__(self):
@@ -533,6 +535,35 @@ class Segment(BasePathMixin):
         Additional values which custom_tags_parser might store per segment
     """
 
+    __slots__ = (
+        "media_sequence",
+        "uri",
+        "duration",
+        "title",
+        "_base_uri",
+        "bitrate",
+        "byterange",
+        "program_date_time",
+        "current_program_date_time",
+        "discontinuity",
+        "cue_out_start",
+        "cue_out_explicitly_duration",
+        "cue_out",
+        "cue_in",
+        "scte35",
+        "oatcls_scte35",
+        "scte35_duration",
+        "scte35_elapsedtime",
+        "asset_metadata",
+        "key",
+        "_parts",
+        "init_section",
+        "_dateranges",
+        "gap_tag",
+        "blackout",
+        "_custom_parser_values",
+    )
+
     def __init__(
         self,
         uri=None,
@@ -583,21 +614,118 @@ class Segment(BasePathMixin):
         self.scte35_elapsedtime = scte35_elapsedtime
         self.asset_metadata = asset_metadata
         self.key = keyobject
-        self.parts = PartialSegmentList(
-            [PartialSegment(base_uri=self._base_uri, **partial) for partial in parts]
+        self._parts = (
+            PartialSegmentList(
+                [PartialSegment._from_parser(partial, base_uri) for partial in parts]
+            )
             if parts
-            else []
+            else None
         )
-        if init_section is not None:
-            self.init_section = InitializationSection(self._base_uri, **init_section)
-        else:
-            self.init_section = None
-        self.dateranges = DateRangeList(
-            [DateRange(**daterange) for daterange in dateranges] if dateranges else []
+        self.init_section = (
+            InitializationSection(base_uri, **init_section)
+            if init_section is not None
+            else None
+        )
+        self._dateranges = (
+            DateRangeList([DateRange(**daterange) for daterange in dateranges])
+            if dateranges
+            else None
         )
         self.gap_tag = gap_tag
         self.blackout = blackout
-        self.custom_parser_values = custom_parser_values or {}
+        self._custom_parser_values = custom_parser_values or None
+
+    @classmethod
+    def _from_parser(cls, data, base_uri=None, keyobject=None, media_sequence=None):
+        self = object.__new__(cls)
+        try:
+            self.uri = data["uri"]
+            self.duration = data["duration"]
+            self.title = data["title"]
+            self.discontinuity = data["discontinuity"]
+            self.cue_out_start = data["cue_out_start"]
+            self.cue_out_explicitly_duration = data["cue_out_explicitly_duration"]
+            self.cue_out = data["cue_out"]
+            self.cue_in = data["cue_in"]
+            self.scte35 = data["scte35"]
+            self.oatcls_scte35 = data["oatcls_scte35"]
+            self.scte35_duration = data["scte35_duration"]
+            self.scte35_elapsedtime = data["scte35_elapsedtime"]
+            self.asset_metadata = data["asset_metadata"]
+            dateranges = data["dateranges"]
+            self.gap_tag = data["gap_tag"]
+            self.blackout = data["blackout"]
+        except KeyError:
+            self.__init__(base_uri=base_uri, keyobject=keyobject, **data)
+            self.media_sequence = media_sequence
+            return self
+
+        self.media_sequence = media_sequence
+        self._base_uri = base_uri
+        self.key = keyobject
+        self.bitrate = data["bitrate"] if "bitrate" in data else None
+        self.byterange = data["byterange"] if "byterange" in data else None
+        self.program_date_time = (
+            data["program_date_time"] if "program_date_time" in data else None
+        )
+        self.current_program_date_time = (
+            data["current_program_date_time"]
+            if "current_program_date_time" in data
+            else None
+        )
+        parts = data["parts"] if "parts" in data else None
+        self._parts = (
+            PartialSegmentList(
+                [PartialSegment._from_parser(part, base_uri) for part in parts]
+            )
+            if parts
+            else None
+        )
+        init_section = data["init_section"] if "init_section" in data else None
+        self.init_section = (
+            InitializationSection(base_uri, **init_section)
+            if init_section is not None
+            else None
+        )
+        self._dateranges = (
+            DateRangeList([DateRange(**daterange) for daterange in dateranges])
+            if dateranges
+            else None
+        )
+        self._custom_parser_values = (
+            data["custom_parser_values"] if "custom_parser_values" in data else None
+        ) or None
+        return self
+
+    @property
+    def parts(self):
+        if (parts := self._parts) is None:
+            self._parts = parts = PartialSegmentList()
+        return parts
+
+    @parts.setter
+    def parts(self, value):
+        self._parts = value
+
+    @property
+    def dateranges(self):
+        if (dateranges := self._dateranges) is None:
+            self._dateranges = dateranges = DateRangeList()
+        return dateranges
+
+    @dateranges.setter
+    def dateranges(self, value):
+        self._dateranges = value
+
+    @property
+    def custom_parser_values(self):
+        if (values := self._custom_parser_values) is None:
+            self._custom_parser_values = values = {}
+        return values
+
+    @custom_parser_values.setter
+    def custom_parser_values(self, value):
+        self._custom_parser_values = value
 
     def add_part(self, part):
         self.parts.append(part)
@@ -625,8 +753,8 @@ class Segment(BasePathMixin):
             dt_s = format_date_time(self.program_date_time, timespec=timespec)
             output.append(f"#EXT-X-PROGRAM-DATE-TIME:{dt_s}\n")
 
-        if len(self.dateranges):
-            output.append(str(self.dateranges))
+        if self._dateranges:
+            output.append(str(self._dateranges))
             output.append("\n")
 
         if self.cue_out_start:
@@ -674,8 +802,8 @@ class Segment(BasePathMixin):
         elif self.oatcls_scte35:
             output.append(f"{ext_oatcls_scte35}:{self.oatcls_scte35}\n")
 
-        if self.parts:
-            output.append(str(self.parts))
+        if self._parts:
+            output.append(str(self._parts))
             output.append("\n")
 
         if self.blackout:
@@ -722,7 +850,8 @@ class Segment(BasePathMixin):
     @base_path.setter
     def base_path(self, newbase_path):
         super(Segment, self.__class__).base_path.fset(self, newbase_path)
-        self.parts.base_path = newbase_path
+        if self._parts:
+            self._parts.base_path = newbase_path
         if self.init_section is not None:
             self.init_section.base_path = newbase_path
 
@@ -733,12 +862,15 @@ class Segment(BasePathMixin):
     @base_uri.setter
     def base_uri(self, newbase_uri):
         self._base_uri = newbase_uri
-        self.parts.base_uri = newbase_uri
+        if self._parts:
+            self._parts.base_uri = newbase_uri
         if self.init_section is not None:
             self.init_section.base_uri = newbase_uri
 
 
 class SegmentList(list, GroupedBasePathMixin):
+    __slots__ = ()
+
     def dumps(self, timespec="milliseconds", infspec="auto"):
         output = []
         last_segment = None
@@ -797,6 +929,19 @@ class PartialSegment(BasePathMixin):
       attribute.
     """
 
+    __slots__ = (
+        "base_uri",
+        "uri",
+        "duration",
+        "program_date_time",
+        "current_program_date_time",
+        "byterange",
+        "independent",
+        "gap",
+        "_dateranges",
+        "gap_tag",
+    )
+
     def __init__(
         self,
         base_uri,
@@ -818,16 +963,59 @@ class PartialSegment(BasePathMixin):
         self.byterange = byterange
         self.independent = independent
         self.gap = gap
-        self.dateranges = DateRangeList(
-            [DateRange(**daterange) for daterange in dateranges] if dateranges else []
+        self._dateranges = (
+            DateRangeList([DateRange(**daterange) for daterange in dateranges])
+            if dateranges
+            else None
         )
         self.gap_tag = gap_tag
+
+    @classmethod
+    def _from_parser(cls, data, base_uri=None):
+        self = object.__new__(cls)
+        try:
+            self.uri = data["uri"]
+            self.duration = data["duration"]
+            dateranges = data["dateranges"]
+            self.gap_tag = data["gap_tag"]
+        except KeyError:
+            self.__init__(base_uri=base_uri, **data)
+            return self
+
+        self.base_uri = base_uri
+        self.program_date_time = (
+            data["program_date_time"] if "program_date_time" in data else None
+        )
+        self.current_program_date_time = (
+            data["current_program_date_time"]
+            if "current_program_date_time" in data
+            else None
+        )
+        self.byterange = data["byterange"] if "byterange" in data else None
+        self.independent = data["independent"] if "independent" in data else None
+        self.gap = data["gap"] if "gap" in data else None
+        self._dateranges = (
+            DateRangeList([DateRange(**daterange) for daterange in dateranges])
+            if dateranges
+            else None
+        )
+        return self
+
+    @property
+    def dateranges(self):
+        if (dateranges := self._dateranges) is None:
+            self._dateranges = dateranges = DateRangeList()
+        return dateranges
+
+    @dateranges.setter
+    def dateranges(self, value):
+        self._dateranges = value
 
     def dumps(self, last_segment):
         output = []
 
-        if len(self.dateranges):
-            output.append(str(self.dateranges))
+        if self._dateranges:
+            output.append(str(self._dateranges))
             output.append("\n")
 
         if self.gap_tag:
@@ -854,6 +1042,8 @@ class PartialSegment(BasePathMixin):
 
 
 class PartialSegmentList(list, GroupedBasePathMixin):
+    __slots__ = ()
+
     def __str__(self):
         output = [str(part) for part in self]
         return "\n".join(output)

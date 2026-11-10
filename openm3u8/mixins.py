@@ -3,6 +3,8 @@ from urllib.parse import urljoin, urlsplit
 
 
 class BasePathMixin:
+    __slots__ = ()
+
     @property
     def absolute_uri(self):
         if self.uri is None:
@@ -39,6 +41,8 @@ class BasePathMixin:
 
 
 class GroupedBasePathMixin:
+    __slots__ = ()
+
     def _set_base_uri(self, new_base_uri):
         for item in self:
             item.base_uri = new_base_uri
