@@ -16,10 +16,12 @@ from unittest import TestCase
 import openm3u8 as m3u8
 from openm3u8.model import (
     DateRange,
+    DateRangeList,
     Key,
     Media,
     MediaList,
     PartialSegment,
+    PartialSegmentList,
     PreloadHint,
     RenditionReport,
     Segment,
@@ -1675,6 +1677,68 @@ class ModelTests(TestCase):
         obj.segments[0].bitrate = 9876
 
         self.assertIn("#EXT-X-BITRATE:9876", obj.dumps().strip())
+
+    def test_segment_and_partial_segment_use_slots(self):
+        segment = Segment(uri="seg.ts", duration=4.0)
+        partial = PartialSegment(None, "part.ts", 0.5)
+
+        self.assertFalse(hasattr(segment, "__dict__"))
+        self.assertFalse(hasattr(partial, "__dict__"))
+        with self.assertRaises(AttributeError):
+            segment.undeclared_attr = 1
+        with self.assertRaises(AttributeError):
+            partial.undeclared_attr = 1
+
+    def test_segment_lazy_containers(self):
+        obj = m3u8.loads(playlists.SIMPLE_PLAYLIST)
+        segment = obj.segments[0]
+
+        # Operations like dumps, base_uri, and base_path must not materialize empty containers
+        obj.dumps()
+        obj.base_uri = "http://example.com/hls/"
+        obj.base_path = "http://example.com/hls"
+        self.assertIsNone(segment._parts)
+        self.assertIsNone(segment._dateranges)
+        self.assertIsNone(segment._custom_parser_values)
+
+        # First access materializes and caches mutable containers
+        self.assertIsInstance(segment.parts, PartialSegmentList)
+        self.assertIs(segment.parts, segment._parts)
+        part = PartialSegment("http://example.com/hls/", "part0.ts", 0.5)
+        segment.parts.append(part)
+        self.assertIsNone(part._dateranges)
+        self.assertIsInstance(part.dateranges, DateRangeList)
+        self.assertIs(part.dateranges, part._dateranges)
+
+        self.assertIsInstance(segment.dateranges, DateRangeList)
+        segment.dateranges.append(
+            DateRange(id="dr1", start_date="2026-01-01T00:00:00Z")
+        )
+        self.assertIn('#EXT-X-DATERANGE:ID="dr1"', segment.dumps(None))
+
+        self.assertEqual(segment.custom_parser_values, {})
+        segment.custom_parser_values["tag"] = "value"
+        self.assertEqual(segment.custom_parser_values["tag"], "value")
+
+    def test_segment_from_parser_preserves_custom_values_and_partial_dicts(self):
+        def save_custom(line, lineno, data, state):
+            if line.startswith("#EXTINF"):
+                state.setdefault("segment", {}).setdefault("custom_parser_values", {})[
+                    "seen_lineno"
+                ] = lineno
+            return False
+
+        obj = m3u8.loads(playlists.SIMPLE_PLAYLIST, custom_tags_parser=save_custom)
+        self.assertEqual(obj.segments[0].custom_parser_values, {"seen_lineno": 3})
+
+        mock_parser_data(
+            obj,
+            {
+                "media_sequence": 10,
+                "segments": [{"uri": "a.ts", "media_sequence": 999}],
+            },
+        )
+        self.assertEqual(obj.segments[0].media_sequence, 10)
 
     def assert_file_content(self, filename, expected):
         with open(filename) as fileobj:
