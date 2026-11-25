@@ -3493,7 +3493,7 @@ m3u8_parser_exec(PyObject *m)
 
 static PyModuleDef_Slot m3u8_parser_slots[] = {
     {Py_mod_exec, m3u8_parser_exec},
-#ifdef Py_mod_multiple_interpreters
+#if defined(Py_mod_multiple_interpreters) && defined(Py_MOD_PER_INTERPRETER_GIL_SUPPORTED)
     {Py_mod_multiple_interpreters, Py_MOD_PER_INTERPRETER_GIL_SUPPORTED},
 #endif
     {0, NULL}
