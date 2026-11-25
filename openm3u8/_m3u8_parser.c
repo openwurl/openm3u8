@@ -8,7 +8,7 @@
  *
  * This module implements the same parsing logic as openm3u8/parser.py in C
  * for improved performance. Output is kept compatible with the pure-Python
- * implementation while targeting the Python 3.10+ stable ABI (Py_LIMITED_API).
+ * implementation while targeting the CPython stable ABI (Py_LIMITED_API).
  *
  * Key optimizations:
  * - Zero-copy SIMD (memchr) line scanning without per-line buffer copies
@@ -27,6 +27,7 @@
 
 #define PY_SSIZE_T_CLEAN
 #include <Python.h>
+#include <assert.h>
 #include <math.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -114,26 +115,9 @@ ascii_contains_ci_upper(const char *haystack, size_t hay_len,
     return 0;
 }
 
-/* Compatibility shims for Py_NewRef/Py_XNewRef (added in Python 3.10). */
-#if PY_VERSION_HEX < 0x030a00f0
-static inline PyObject *
-Py_NewRef(PyObject *obj)
-{
-    Py_INCREF(obj);
-    return obj;
-}
-
-static inline PyObject *
-Py_XNewRef(PyObject *obj)
-{
-    Py_XINCREF(obj);
-    return obj;
-}
-#endif
-
 /* Safe owned-pointer replacement (decrefs old after assigning new). */
 static inline void
-pyobj_replace(PyObject **slot, PyObject *new_val)
+replace_owned_ref(PyObject **slot, PyObject *new_val)
 {
     PyObject *old = *slot;
     *slot = new_val;
@@ -143,9 +127,10 @@ pyobj_replace(PyObject **slot, PyObject *new_val)
 /*
  * Exact IEEE 754 powers of 10 from 10^0 to 10^22.
  * All 23 values are exactly representable in IEEE 754 binary64 because
- * 5^22 < 2^53. Combined with an integer mantissa < 10^15 < 2^53,
- * `(double)mantissa / POW10[frac_digits]` performs a single IEEE 754
- * division and is guaranteed bit-for-bit identical to strtod / Python float().
+ * 5^22 < 2^53. Combined with an integer mantissa < 10^15 < 2^53, under
+ * standard IEEE 754 round-to-nearest-even binary64 arithmetic (do NOT
+ * compile with -ffast-math / -Ofast), `(double)mantissa / EXACT_POW10[frac_digits]`
+ * performs a single correctly rounded division matching strtod / Python float().
  */
 static const double EXACT_POW10[23] = {
     1e0,  1e1,  1e2,  1e3,  1e4,  1e5,  1e6,  1e7,
@@ -154,20 +139,13 @@ static const double EXACT_POW10[23] = {
 };
 
 /*
- * Fast exact decimal float parser for simple non-negative decimals.
+ * Fast exact decimal float parser for pre-trimmed simple non-negative decimals.
  * Returns 1 and writes *out on fast-path hit; returns 0 to defer to
  * PyOS_string_to_double (signs, exponents, >15 sig digits, >22 frac digits, etc.).
  */
 static inline int
 fast_parse_double(const char *s, size_t len, double *out)
 {
-    while (len > 0 && ascii_isspace((unsigned char)*s)) {
-        s++;
-        len--;
-    }
-    while (len > 0 && ascii_isspace((unsigned char)s[len - 1])) {
-        len--;
-    }
     if (len == 0) {
         return 0;
     }
@@ -220,14 +198,28 @@ fast_parse_double(const char *s, size_t len, double *out)
 
 /*
  * Parse double from (s, len) using fast_parse_double with fallback to
- * PyOS_string_to_double. Returns 0 on success, -1 on parse failure
- * (without leaving a Python exception set).
+ * PyOS_string_to_double.
+ *
+ * Returns:
+ *   1 on success (*out populated)
+ *   0 on invalid float syntax (ValueError cleared, no exception set)
+ *  -1 on fatal error (e.g. MemoryError, exception remains set)
  */
 static inline int
 parse_double_slice(const char *s, size_t len, double *out)
 {
-    if (fast_parse_double(s, len, out)) {
+    while (len > 0 && ascii_isspace((unsigned char)*s)) {
+        s++;
+        len--;
+    }
+    while (len > 0 && ascii_isspace((unsigned char)s[len - 1])) {
+        len--;
+    }
+    if (len == 0) {
         return 0;
+    }
+    if (fast_parse_double(s, len, out)) {
+        return 1;
     }
     char stack_buf[64];
     char *buf = stack_buf;
@@ -235,7 +227,7 @@ parse_double_slice(const char *s, size_t len, double *out)
     if (use_heap) {
         buf = PyMem_Malloc(len + 1);
         if (buf == NULL) {
-            PyErr_Clear();
+            PyErr_NoMemory();
             return -1;
         }
     }
@@ -246,11 +238,14 @@ parse_double_slice(const char *s, size_t len, double *out)
         PyMem_Free(buf);
     }
     if (v == -1.0 && PyErr_Occurred()) {
-        PyErr_Clear();
+        if (PyErr_ExceptionMatches(PyExc_ValueError)) {
+            PyErr_Clear();
+            return 0;
+        }
         return -1;
     }
     *out = v;
-    return 0;
+    return 1;
 }
 
 /*
@@ -504,11 +499,13 @@ typedef struct {
     m3u8_state *mod_state;          /* Borrowed */
     PyObject *data;                 /* Owned by m3u8_parse */
     PyObject *state;                /* Owned, lazy (NULL unless custom_tags_parser) */
-    PyObject *segments_list;        /* Borrowed ref to data["segments"] */
-    PyObject *keys_list;            /* Borrowed ref to data["keys"] */
+    PyObject *segments_list;        /* Owned ref to data["segments"] (cached when !has_custom_parser) */
+    PyObject *keys_list;            /* Owned ref to data["keys"] (cached when !has_custom_parser) */
+    PyObject *keys_seen;            /* Owned set of frozenset(key.items()) for O(1) dedup (>8 keys) */
     int keys_has_none;              /* 1 once Py_None is known present in data["keys"] */
+    int has_custom_parser;          /* 1 if custom_tags_parser is callable */
     int strict;
-    int lineno;
+    Py_ssize_t lineno;
 
     int expect_segment;
     int expect_playlist;
@@ -529,6 +526,7 @@ typedef struct {
     PyObject *current_program_date_time;
     int has_pending_pdt_add;
     double pending_pdt_secs;
+    double pdt_safe_secs;           /* Remaining margin safe to defer without overflow */
 
     PyObject *current_key;
     PyObject *current_segment_map;
@@ -562,9 +560,44 @@ dict_set_interned(PyObject *dict, PyObject *interned_key, PyObject *value)
 }
 
 static inline PyObject *
-dict_get_interned(PyObject *dict, PyObject *interned_key)
+dict_get_borrowed(PyObject *dict, PyObject *interned_key)
 {
     return PyDict_GetItemWithError(dict, interned_key);
+}
+
+/* Safe owned-reference lookup for callback-controlled mutable dicts. */
+static inline PyObject *
+dict_get_owned(PyObject *dict, PyObject *interned_key)
+{
+    return Py_XNewRef(PyDict_GetItemWithError(dict, interned_key));
+}
+
+/* Truthiness check that holds an owned ref across __bool__/__len__. */
+static inline int
+owned_truth(PyObject *obj)
+{
+    Py_INCREF(obj);
+    int result = PyObject_IsTrue(obj);
+    Py_DECREF(obj);
+    return result;
+}
+
+static inline PyObject *
+get_segments_list_owned(ParseContext *ctx)
+{
+    if (!ctx->has_custom_parser) {
+        return Py_XNewRef(ctx->segments_list);
+    }
+    return dict_get_owned(ctx->data, ctx->mod_state->str_segments);
+}
+
+static inline PyObject *
+get_keys_list_owned(ParseContext *ctx)
+{
+    if (!ctx->has_custom_parser) {
+        return Py_XNewRef(ctx->keys_list);
+    }
+    return dict_get_owned(ctx->data, ctx->mod_state->str_keys);
 }
 
 static inline int
@@ -600,11 +633,13 @@ static inline int
 append_to_data_list(ParseContext *ctx, PyObject *list_key, PyObject *item,
                     const char *err_msg)
 {
-    PyObject *list = dict_get_interned(ctx->data, list_key);
+    PyObject *list = dict_get_owned(ctx->data, list_key);
     if (list == NULL && PyErr_Occurred()) {
         return -1;
     }
-    return append_to_list(list, item, err_msg);
+    int rc = append_to_list(list, item, err_msg);
+    Py_XDECREF(list);
+    return rc;
 }
 
 static inline m3u8_state *
@@ -619,6 +654,9 @@ static void
 parse_context_clear(ParseContext *ctx)
 {
     Py_CLEAR(ctx->state);
+    Py_CLEAR(ctx->segments_list);
+    Py_CLEAR(ctx->keys_list);
+    Py_CLEAR(ctx->keys_seen);
     Py_CLEAR(ctx->extinf_duration_obj);
     Py_CLEAR(ctx->segment);
     Py_CLEAR(ctx->program_date_time);
@@ -651,32 +689,37 @@ init_cached_objects(m3u8_state *state)
     }
 
     state->datetime_cls = PyObject_GetAttrString(datetime_mod, "datetime");
-    state->timedelta_cls = PyObject_GetAttrString(datetime_mod, "timedelta");
-    if (state->datetime_cls != NULL) {
-        state->fromisoformat_meth = PyObject_GetAttrString(
-            state->datetime_cls, "fromisoformat");
+    if (state->datetime_cls == NULL) {
+        Py_DECREF(datetime_mod);
+        return -1;
     }
-    Py_DECREF(datetime_mod);
 
-    if (state->datetime_cls == NULL ||
-        state->timedelta_cls == NULL ||
-        state->fromisoformat_meth == NULL)
-    {
+    state->timedelta_cls = PyObject_GetAttrString(datetime_mod, "timedelta");
+    Py_DECREF(datetime_mod);
+    if (state->timedelta_cls == NULL) {
+        return -1;
+    }
+
+    state->fromisoformat_meth = PyObject_GetAttrString(
+        state->datetime_cls, "fromisoformat");
+    if (state->fromisoformat_meth == NULL) {
         return -1;
     }
 
     state->int_zero = PyLong_FromLong(0);
+    if (state->int_zero == NULL) {
+        return -1;
+    }
     state->float_zero = PyFloat_FromDouble(0.0);
-    if (state->int_zero == NULL || state->float_zero == NULL) {
+    if (state->float_zero == NULL) {
         return -1;
     }
 
     /*
-     * Pre-populate the 16 keys present on every complete segment dict.
-     * CPython sizes this dict to 32 (usable capacity 21), so PyDict_Copy
-     * allocates the final table in one shot with zero resizes even when
-     * optional keys (program_date_time, current_program_date_time, key,
-     * init_section) are inserted.
+     * Pre-populate the 16 keys present on every complete segment dict with
+     * immutable default values. Copying this template via PyDict_Copy avoids
+     * 16 per-segment dict insertions; all template values are immutable
+     * singletons/primitives so shallow copying is safe.
      */
     PyObject *tmpl = PyDict_New();
     if (tmpl == NULL) {
@@ -718,9 +761,9 @@ init_interned_strings(m3u8_state *state)
 }
 
 static void
-raise_parse_error(m3u8_state *state, int lineno, const char *line, size_t line_len)
+raise_parse_error(m3u8_state *state, Py_ssize_t lineno, const char *line, size_t line_len)
 {
-    PyObject *py_lineno = PyLong_FromLong(lineno);
+    PyObject *py_lineno = PyLong_FromSsize_t(lineno);
     if (py_lineno == NULL) {
         return;
     }
@@ -783,7 +826,7 @@ datetime_add_seconds(ParseContext *ctx, PyObject *dt, double secs)
     int slot = ctx->td_cache_next;
     ctx->td_cache_next = 1 - slot;
     ctx->td_cache[slot].secs = secs;
-    pyobj_replace(&ctx->td_cache[slot].td, new_td);
+    replace_owned_ref(&ctx->td_cache[slot].td, new_td);
 
     return new_dt;
 }
@@ -806,7 +849,33 @@ flush_pending_pdt(ParseContext *ctx)
     if (new_pdt == NULL) {
         return -1;
     }
-    pyobj_replace(&ctx->current_program_date_time, new_pdt);
+    replace_owned_ref(&ctx->current_program_date_time, new_pdt);
+    return 0;
+}
+
+/*
+ * Advance current_program_date_time by `secs`.
+ * Defers the datetime + timedelta addition only when current_program_date_time
+ * is a known real datetime.datetime with sufficient margin before MINYEAR/MAXYEAR
+ * that the addition is mathematically guaranteed not to raise OverflowError or
+ * invoke custom __add__ side effects.
+ */
+static inline int
+advance_pdt(ParseContext *ctx, double secs)
+{
+    double abs_secs = fabs(secs);
+    if (isfinite(secs) && abs_secs < ctx->pdt_safe_secs) {
+        ctx->pdt_safe_secs -= abs_secs;
+        ctx->has_pending_pdt_add = 1;
+        ctx->pending_pdt_secs = secs;
+        return 0;
+    }
+    PyObject *new_pdt = datetime_add_seconds(ctx, ctx->current_program_date_time, secs);
+    if (new_pdt == NULL) {
+        return -1;
+    }
+    ctx->pdt_safe_secs = 0.0;
+    replace_owned_ref(&ctx->current_program_date_time, new_pdt);
     return 0;
 }
 
@@ -816,7 +885,7 @@ flush_pending_pdt(ParseContext *ctx)
  * Returns borrowed ref to ctx->segment or NULL on error.
  */
 static PyObject *
-materialize_segment(ParseContext *ctx)
+ensure_segment_borrowed(ParseContext *ctx)
 {
     if (ctx->segment != NULL) {
         return ctx->segment;
@@ -868,7 +937,7 @@ sync_ctx_to_state_dict(ParseContext *ctx)
     if (flush_pending_pdt(ctx) < 0) {
         return -1;
     }
-    if (ctx->has_extinf && materialize_segment(ctx) == NULL) {
+    if (ctx->has_extinf && ensure_segment_borrowed(ctx) == NULL) {
         return -1;
     }
 
@@ -945,9 +1014,9 @@ sync_state_dict_to_ctx(ParseContext *ctx)
     PyObject *val;
     int truth;
 
-    val = dict_get_interned(st, ms->str_expect_segment);
+    val = dict_get_borrowed(st, ms->str_expect_segment);
     if (val != NULL) {
-        truth = PyObject_IsTrue(val);
+        truth = owned_truth(val);
         if (truth < 0) return -1;
         ctx->expect_segment = truth;
     } else if (PyErr_Occurred()) {
@@ -956,9 +1025,9 @@ sync_state_dict_to_ctx(ParseContext *ctx)
         ctx->expect_segment = 0;
     }
 
-    val = dict_get_interned(st, ms->str_expect_playlist);
+    val = dict_get_borrowed(st, ms->str_expect_playlist);
     if (val != NULL) {
-        truth = PyObject_IsTrue(val);
+        truth = owned_truth(val);
         if (truth < 0) return -1;
         ctx->expect_playlist = truth;
     } else if (PyErr_Occurred()) {
@@ -970,9 +1039,9 @@ sync_state_dict_to_ctx(ParseContext *ctx)
     ctx->seg_flags = 0;
     #define SYNC_FLAG_FROM_DICT(bit, key_field) \
         do { \
-            val = dict_get_interned(st, ms->key_field); \
+            val = dict_get_borrowed(st, ms->key_field); \
             if (val != NULL) { \
-                truth = PyObject_IsTrue(val); \
+                truth = owned_truth(val); \
                 if (truth < 0) return -1; \
                 if (truth) ctx->seg_flags |= (bit); \
             } else if (PyErr_Occurred()) { \
@@ -990,14 +1059,14 @@ sync_state_dict_to_ctx(ParseContext *ctx)
 
     #define SYNC_OBJ_FROM_DICT(field, key_field, none_is_null) \
         do { \
-            val = dict_get_interned(st, ms->key_field); \
+            val = dict_get_borrowed(st, ms->key_field); \
             if (val == NULL) { \
                 if (PyErr_Occurred()) return -1; \
-                pyobj_replace(&ctx->field, NULL); \
+                replace_owned_ref(&ctx->field, NULL); \
             } else if ((none_is_null) && val == Py_None) { \
-                pyobj_replace(&ctx->field, NULL); \
+                replace_owned_ref(&ctx->field, NULL); \
             } else { \
-                pyobj_replace(&ctx->field, Py_NewRef(val)); \
+                replace_owned_ref(&ctx->field, Py_NewRef(val)); \
             } \
         } while (0)
 
@@ -1021,14 +1090,19 @@ sync_state_dict_to_ctx(ParseContext *ctx)
     #undef SYNC_OBJ_FROM_DICT
 
     /* Invalidate cached data pointers/caches in case callback mutated data */
-    ctx->segments_list = dict_get_interned(ctx->data, ms->str_segments);
-    if (ctx->segments_list == NULL && PyErr_Occurred()) return -1;
-    ctx->keys_list = dict_get_interned(ctx->data, ms->str_keys);
-    if (ctx->keys_list == NULL && PyErr_Occurred()) return -1;
+    PyObject *segments = dict_get_borrowed(ctx->data, ms->str_segments);
+    if (segments == NULL && PyErr_Occurred()) return -1;
+    replace_owned_ref(&ctx->segments_list, Py_XNewRef(segments));
+
+    PyObject *keys = dict_get_borrowed(ctx->data, ms->str_keys);
+    if (keys == NULL && PyErr_Occurred()) return -1;
+    replace_owned_ref(&ctx->keys_list, Py_XNewRef(keys));
+
     ctx->keys_has_none = 0;
     ctx->last_key_val_ptr = NULL;
     ctx->last_key_val_len = 0;
     ctx->has_pending_pdt_add = 0;
+    ctx->pdt_safe_secs = 0.0;
     return 0;
 }
 
@@ -1036,6 +1110,10 @@ sync_state_dict_to_ctx(ParseContext *ctx)
 static PyObject *
 build_stripped_splitlines(const char *trimmed, size_t trimmed_len)
 {
+    if (trimmed_len == 0) {
+        return PyList_New(0);
+    }
+
     const unsigned char *p = (const unsigned char *)trimmed;
     const unsigned char *end = p + trimmed_len;
 
@@ -1185,6 +1263,9 @@ create_normalized_key(const char *s, size_t len)
     while (len > 0 && ascii_isspace((unsigned char)s[len - 1])) {
         len--;
     }
+    if (len == 0) {
+        return PyUnicode_FromStringAndSize("", 0);
+    }
 
     char stack_buf[64];
     char *buf = stack_buf;
@@ -1227,6 +1308,9 @@ create_lower_stripped(const char *s, size_t len)
     while (len > 0 && ascii_isspace((unsigned char)s[len - 1])) {
         len--;
     }
+    if (len == 0) {
+        return PyUnicode_FromStringAndSize("", 0);
+    }
 
     char stack_buf[64];
     char *buf = stack_buf;
@@ -1267,6 +1351,55 @@ typedef struct {
 
 #define ATTR_DEF(name_str, field, attr_type) \
     {name_str, sizeof(name_str) - 1, offsetof(m3u8_state, field), attr_type}
+
+static inline PyObject *
+convert_attr_value(const char *val_start, size_t val_len, AttrType type,
+                   int is_quoted, int has_closing_quote,
+                   const char *full_start, size_t full_len)
+{
+    if (is_quoted) {
+        if (type == ATTR_QUOTED_STRING) {
+            if (has_closing_quote) {
+                return PyUnicode_FromStringAndSize(val_start, (Py_ssize_t)val_len);
+            }
+            return PyUnicode_FromStringAndSize(full_start, (Py_ssize_t)full_len);
+        }
+        if (type == ATTR_STRING) {
+            return PyUnicode_FromStringAndSize(full_start, (Py_ssize_t)full_len);
+        }
+    }
+
+    if (type == ATTR_INT) {
+        PyObject *py_val = parse_int_slice(val_start, val_len);
+        if (py_val != NULL || PyErr_Occurred()) {
+            return py_val;
+        }
+        return PyUnicode_FromStringAndSize(val_start, (Py_ssize_t)val_len);
+    }
+    if (type == ATTR_BANDWIDTH) {
+        double v;
+        int drc = parse_double_slice(val_start, val_len, &v);
+        if (drc < 0) {
+            return NULL;
+        }
+        if (drc > 0 && isfinite(v)) {
+            return PyLong_FromDouble(v);
+        }
+        return PyUnicode_FromStringAndSize(val_start, (Py_ssize_t)val_len);
+    }
+    if (type == ATTR_FLOAT) {
+        double v;
+        int drc = parse_double_slice(val_start, val_len, &v);
+        if (drc < 0) {
+            return NULL;
+        }
+        if (drc > 0) {
+            return PyFloat_FromDouble(v);
+        }
+        return PyUnicode_FromStringAndSize(val_start, (Py_ssize_t)val_len);
+    }
+    return PyUnicode_FromStringAndSize(val_start, (Py_ssize_t)val_len);
+}
 
 /*
  * Schema-aware zero-copy attribute list parser.
@@ -1335,60 +1468,29 @@ parse_attributes_with_schema(m3u8_state *ms, const char *start, const char *end,
                 }
             }
 
-            PyObject *py_val = NULL;
+            const char *val_start;
+            size_t val_len;
+            const char *full_start = p;
+            size_t full_len = 0;
+            int is_quoted = 0;
+            int has_closing_quote = 0;
+
             if (p < end && (*p == '"' || *p == '\'')) {
                 char quote = *p++;
-                const char *full_start = p - 1;
-                const char *val_start = p;
+                is_quoted = 1;
+                val_start = p;
                 while (p < end && *p != quote) {
                     p++;
                 }
                 const char *val_end = p;
-                int has_closing_quote = (p < end && *p == quote);
-                size_t val_len = (size_t)(val_end - val_start);
+                has_closing_quote = (p < end && *p == quote);
+                val_len = (size_t)(val_end - val_start);
                 if (has_closing_quote) {
                     p++;
                 }
-
-                if (type == ATTR_QUOTED_STRING) {
-                    if (has_closing_quote) {
-                        py_val = PyUnicode_FromStringAndSize(val_start, (Py_ssize_t)val_len);
-                    } else {
-                        py_val = PyUnicode_FromStringAndSize(
-                            full_start, (Py_ssize_t)(val_end - full_start));
-                    }
-                } else if (type == ATTR_STRING) {
-                    Py_ssize_t full_len = has_closing_quote
-                        ? (Py_ssize_t)((val_end - full_start) + 1)
-                        : (Py_ssize_t)(val_end - full_start);
-                    py_val = PyUnicode_FromStringAndSize(full_start, full_len);
-                } else if (type == ATTR_INT) {
-                    py_val = parse_int_slice(val_start, val_len);
-                    if (py_val == NULL) {
-                        if (PyErr_Occurred()) {
-                            Py_DECREF(py_key);
-                            Py_DECREF(attrs);
-                            return NULL;
-                        }
-                        py_val = PyUnicode_FromStringAndSize(val_start, (Py_ssize_t)val_len);
-                    }
-                } else if (type == ATTR_BANDWIDTH) {
-                    double v;
-                    if (parse_double_slice(val_start, val_len, &v) == 0 && isfinite(v)) {
-                        py_val = PyLong_FromDouble(v);
-                    } else {
-                        py_val = PyUnicode_FromStringAndSize(val_start, (Py_ssize_t)val_len);
-                    }
-                } else if (type == ATTR_FLOAT) {
-                    double v;
-                    if (parse_double_slice(val_start, val_len, &v) == 0) {
-                        py_val = PyFloat_FromDouble(v);
-                    } else {
-                        py_val = PyUnicode_FromStringAndSize(val_start, (Py_ssize_t)val_len);
-                    }
-                }
+                full_len = (size_t)(p - full_start);
             } else {
-                const char *val_start = p;
+                val_start = p;
                 while (p < end && *p != ',') {
                     p++;
                 }
@@ -1396,37 +1498,12 @@ parse_attributes_with_schema(m3u8_state *ms, const char *start, const char *end,
                 while (val_end > val_start && ascii_isspace((unsigned char)*(val_end - 1))) {
                     val_end--;
                 }
-                size_t val_len = (size_t)(val_end - val_start);
-
-                if (type == ATTR_INT) {
-                    py_val = parse_int_slice(val_start, val_len);
-                    if (py_val == NULL) {
-                        if (PyErr_Occurred()) {
-                            Py_DECREF(py_key);
-                            Py_DECREF(attrs);
-                            return NULL;
-                        }
-                        py_val = PyUnicode_FromStringAndSize(val_start, (Py_ssize_t)val_len);
-                    }
-                } else if (type == ATTR_BANDWIDTH) {
-                    double v;
-                    if (parse_double_slice(val_start, val_len, &v) == 0 && isfinite(v)) {
-                        py_val = PyLong_FromDouble(v);
-                    } else {
-                        py_val = PyUnicode_FromStringAndSize(val_start, (Py_ssize_t)val_len);
-                    }
-                } else if (type == ATTR_FLOAT) {
-                    double v;
-                    if (parse_double_slice(val_start, val_len, &v) == 0) {
-                        py_val = PyFloat_FromDouble(v);
-                    } else {
-                        py_val = PyUnicode_FromStringAndSize(val_start, (Py_ssize_t)val_len);
-                    }
-                } else {
-                    py_val = PyUnicode_FromStringAndSize(val_start, (Py_ssize_t)val_len);
-                }
+                val_len = (size_t)(val_end - val_start);
             }
 
+            PyObject *py_val = convert_attr_value(
+                val_start, val_len, type, is_quoted, has_closing_quote,
+                full_start, full_len);
             if (py_val == NULL) {
                 Py_DECREF(py_key);
                 Py_DECREF(attrs);
@@ -1647,25 +1724,40 @@ static const AttrParser key_parsers[] = {
 static int
 ensure_none_in_keys(ParseContext *ctx)
 {
-    PyObject *keys = ctx->keys_list;
-    if (keys == NULL || !PyList_Check(keys)) {
+    PyObject *keys = get_keys_list_owned(ctx);
+    if (keys == NULL) {
+        if (!PyErr_Occurred()) {
+            PyErr_SetString(PyExc_TypeError, "data['keys'] must be a list");
+        }
+        return -1;
+    }
+    if (!PyList_Check(keys)) {
         PyErr_SetString(PyExc_TypeError, "data['keys'] must be a list");
+        Py_DECREF(keys);
         return -1;
     }
     Py_ssize_t n = PyList_Size(keys);
     if (n < 0) {
+        Py_DECREF(keys);
         return -1;
     }
     for (Py_ssize_t i = 0; i < n; i++) {
         if (PyList_GetItem(keys, i) == Py_None) {
-            ctx->keys_has_none = 1;
+            if (!ctx->has_custom_parser) {
+                ctx->keys_has_none = 1;
+            }
+            Py_DECREF(keys);
             return 0;
         }
     }
-    if (PyList_Append(keys, Py_None) < 0) {
+    int rc = PyList_Append(keys, Py_None);
+    Py_DECREF(keys);
+    if (rc < 0) {
         return -1;
     }
-    ctx->keys_has_none = 1;
+    if (!ctx->has_custom_parser) {
+        ctx->keys_has_none = 1;
+    }
     return 0;
 }
 
@@ -1707,7 +1799,11 @@ handle_extinf(ParseContext *ctx, const char *line, size_t line_len,
         duration = ctx->last_dur_val;
         py_duration = Py_NewRef(ctx->last_dur_obj);
     } else {
-        if (parse_double_slice(dur_start, dur_len, &duration) < 0) {
+        int drc = parse_double_slice(dur_start, dur_len, &duration);
+        if (drc < 0) {
+            return -1;
+        }
+        if (drc == 0) {
             duration = 0.0;
         }
         py_duration = PyFloat_FromDouble(duration);
@@ -1718,7 +1814,7 @@ handle_extinf(ParseContext *ctx, const char *line, size_t line_len,
             memcpy(ctx->last_dur_buf, dur_start, dur_len);
             ctx->last_dur_len = dur_len;
             ctx->last_dur_val = duration;
-            pyobj_replace(&ctx->last_dur_obj, Py_NewRef(py_duration));
+            replace_owned_ref(&ctx->last_dur_obj, Py_NewRef(py_duration));
         }
     }
 
@@ -1748,7 +1844,7 @@ handle_extinf(ParseContext *ctx, const char *line, size_t line_len,
         /* Fast path: defer segment dict creation until URI line */
         ctx->has_extinf = 1;
         ctx->extinf_duration = duration;
-        pyobj_replace(&ctx->extinf_duration_obj, py_duration);
+        replace_owned_ref(&ctx->extinf_duration_obj, py_duration);
         ctx->extinf_title_ptr = title_start;
         ctx->extinf_title_len = title_len;
     }
@@ -1835,16 +1931,9 @@ parse_ts_chunk(ParseContext *ctx, const char *line, size_t line_len)
                 Py_DECREF(segment);
                 return -1;
             }
-            if (isfinite(dur) && fabs(dur) < 1e12) {
-                ctx->has_pending_pdt_add = 1;
-                ctx->pending_pdt_secs = dur;
-            } else {
-                PyObject *new_pdt = datetime_add_seconds(ctx, ctx->current_program_date_time, dur);
-                if (new_pdt == NULL) {
-                    Py_DECREF(segment);
-                    return -1;
-                }
-                pyobj_replace(&ctx->current_program_date_time, new_pdt);
+            if (advance_pdt(ctx, dur) < 0) {
+                Py_DECREF(segment);
+                return -1;
             }
         }
 
@@ -1950,25 +2039,18 @@ parse_ts_chunk(ParseContext *ctx, const char *line, size_t line_len)
             {
                 goto fail_seg;
             }
-            PyObject *duration_obj = dict_get_interned(segment, ms->str_duration);
+            PyObject *duration_obj = dict_get_owned(segment, ms->str_duration);
             if (duration_obj == NULL && PyErr_Occurred()) {
                 goto fail_seg;
             }
             if (duration_obj != NULL) {
                 double secs = PyFloat_AsDouble(duration_obj);
+                Py_DECREF(duration_obj);
                 if (secs == -1.0 && PyErr_Occurred()) {
                     goto fail_seg;
                 }
-                if (isfinite(secs) && fabs(secs) < 1e12) {
-                    ctx->has_pending_pdt_add = 1;
-                    ctx->pending_pdt_secs = secs;
-                } else {
-                    PyObject *new_pdt = datetime_add_seconds(
-                        ctx, ctx->current_program_date_time, secs);
-                    if (new_pdt == NULL) {
-                        goto fail_seg;
-                    }
-                    pyobj_replace(&ctx->current_program_date_time, new_pdt);
+                if (advance_pdt(ctx, secs) < 0) {
+                    goto fail_seg;
                 }
             }
         }
@@ -2034,12 +2116,15 @@ parse_ts_chunk(ParseContext *ctx, const char *line, size_t line_len)
     ctx->seg_flags = 0;
     ctx->expect_segment = 0;
 
-    if (append_to_list(ctx->segments_list, segment, "data['segments'] must be a list") < 0) {
+    PyObject *segments = get_segments_list_owned(ctx);
+    if (segments == NULL && PyErr_Occurred()) {
         Py_DECREF(segment);
         return -1;
     }
+    int append_rc = append_to_list(segments, segment, "data['segments'] must be a list");
+    Py_XDECREF(segments);
     Py_DECREF(segment);
-    return 0;
+    return append_rc;
 
 fail_seg:
     Py_DECREF(segment);
@@ -2112,7 +2197,7 @@ handle_program_date_time(ParseContext *ctx, const char *val, size_t val_len)
         return -1;
     }
 
-    PyObject *existing = dict_get_interned(ctx->data, ms->str_program_date_time);
+    PyObject *existing = dict_get_borrowed(ctx->data, ms->str_program_date_time);
     if (existing == NULL && PyErr_Occurred()) {
         Py_DECREF(dt);
         return -1;
@@ -2124,11 +2209,47 @@ handle_program_date_time(ParseContext *ctx, const char *val, size_t val_len)
         }
     }
 
+    /*
+     * Compute guaranteed-safe margin before datetime.MINYEAR / MAXYEAR so
+     * advance_pdt() only defers additions that cannot raise OverflowError.
+     */
+    double safe_secs = 0.0;
+    if (!ctx->has_custom_parser && val_len >= 4 &&
+        val[0] >= '0' && val[0] <= '9' &&
+        val[1] >= '0' && val[1] <= '9' &&
+        val[2] >= '0' && val[2] <= '9' &&
+        val[3] >= '0' && val[3] <= '9')
+    {
+        int year = (val[0] - '0') * 1000 + (val[1] - '0') * 100 +
+                   (val[2] - '0') * 10 + (val[3] - '0');
+        if (year >= 2 && year <= 9998) {
+            int margin_years = (year - 1 < 9999 - year) ? (year - 1) : (9999 - year);
+            /* Reserve 2 days for leap days and max +-24h UTC offset */
+            safe_secs = ((double)margin_years * 365.0 - 2.0) * 86400.0;
+            if (safe_secs > 1e12) {
+                safe_secs = 1e12;
+            }
+        }
+    }
+
     /* Discard any deferred addition from the previous segment */
     ctx->has_pending_pdt_add = 0;
-    pyobj_replace(&ctx->current_program_date_time, Py_NewRef(dt));
-    pyobj_replace(&ctx->program_date_time, dt);
+    ctx->pdt_safe_secs = safe_secs;
+    replace_owned_ref(&ctx->current_program_date_time, Py_NewRef(dt));
+    replace_owned_ref(&ctx->program_date_time, dt);
     return 0;
+}
+
+static PyObject *
+key_dict_identity(PyObject *key_dict)
+{
+    PyObject *items = PyDict_Items(key_dict);
+    if (items == NULL) {
+        return NULL;
+    }
+    PyObject *identity = PyFrozenSet_New(items);
+    Py_DECREF(items);
+    return identity;
 }
 
 static int
@@ -2145,7 +2266,7 @@ handle_key(ParseContext *ctx, const char *val, size_t val_len)
         if (key_copy == NULL) {
             return -1;
         }
-        pyobj_replace(&ctx->current_key, key_copy);
+        replace_owned_ref(&ctx->current_key, key_copy);
         return 0;
     }
 
@@ -2155,21 +2276,121 @@ handle_key(ParseContext *ctx, const char *val, size_t val_len)
         return -1;
     }
 
-    pyobj_replace(&ctx->current_key, Py_NewRef(key));
+    replace_owned_ref(&ctx->current_key, Py_NewRef(key));
 
-    PyObject *keys = ctx->keys_list;
-    if (keys == NULL || !PyList_Check(keys)) {
-        PyErr_SetString(PyExc_TypeError, "data['keys'] must be a list");
+    PyObject *keys = get_keys_list_owned(ctx);
+    if (keys == NULL) {
+        if (!PyErr_Occurred()) {
+            PyErr_SetString(PyExc_TypeError, "data['keys'] must be a list");
+        }
         Py_DECREF(key);
         return -1;
     }
+    if (!PyList_Check(keys)) {
+        PyErr_SetString(PyExc_TypeError, "data['keys'] must be a list");
+        Py_DECREF(keys);
+        Py_DECREF(key);
+        return -1;
+    }
+
+    if (!ctx->has_custom_parser) {
+        /*
+         * Lazily build a hash-set index once the playlist has >= 8 distinct
+         * keys so rotating-key playlists stay O(K) instead of O(K^2), with
+         * zero allocation overhead for typical 0-8 key playlists.
+         */
+        if (ctx->keys_seen == NULL) {
+            Py_ssize_t nkeys = PyList_Size(keys);
+            if (nkeys < 0) {
+                Py_DECREF(keys);
+                Py_DECREF(key);
+                return -1;
+            }
+            if (nkeys >= 8) {
+                PyObject *seen = PySet_New(NULL);
+                if (seen == NULL) {
+                    Py_DECREF(keys);
+                    Py_DECREF(key);
+                    return -1;
+                }
+                for (Py_ssize_t i = 0; i < nkeys; i++) {
+                    PyObject *existing = PyList_GetItem(keys, i);
+                    if (existing == NULL) {
+                        Py_DECREF(seen);
+                        Py_DECREF(keys);
+                        Py_DECREF(key);
+                        return -1;
+                    }
+                    if (!PyDict_Check(existing)) {
+                        continue;
+                    }
+                    PyObject *id = key_dict_identity(existing);
+                    if (id == NULL) {
+                        Py_DECREF(seen);
+                        Py_DECREF(keys);
+                        Py_DECREF(key);
+                        return -1;
+                    }
+                    int add_rc = PySet_Add(seen, id);
+                    Py_DECREF(id);
+                    if (add_rc < 0) {
+                        Py_DECREF(seen);
+                        Py_DECREF(keys);
+                        Py_DECREF(key);
+                        return -1;
+                    }
+                }
+                ctx->keys_seen = seen;
+            }
+        }
+
+        if (ctx->keys_seen != NULL) {
+            PyObject *id = key_dict_identity(key);
+            if (id == NULL) {
+                Py_DECREF(keys);
+                Py_DECREF(key);
+                return -1;
+            }
+            int found = PySet_Contains(ctx->keys_seen, id);
+            if (found < 0) {
+                Py_DECREF(id);
+                Py_DECREF(keys);
+                Py_DECREF(key);
+                return -1;
+            }
+            if (found == 0) {
+                if (PySet_Add(ctx->keys_seen, id) < 0 || PyList_Append(keys, key) < 0) {
+                    Py_DECREF(id);
+                    Py_DECREF(keys);
+                    Py_DECREF(key);
+                    return -1;
+                }
+            }
+            Py_DECREF(id);
+            Py_DECREF(keys);
+            ctx->last_key_val_ptr = val;
+            ctx->last_key_val_len = val_len;
+            replace_owned_ref(&ctx->last_key_dict, key);
+            return 0;
+        }
+    }
+
     int found = PySequence_Contains(keys, key);
+    Py_DECREF(keys);
     if (found < 0) {
         Py_DECREF(key);
         return -1;
     }
     if (found == 0) {
-        if (PyList_Append(keys, key) < 0) {
+        /* Re-fetch authoritative data['keys'] in case __eq__ replaced it */
+        PyObject *target_keys = get_keys_list_owned(ctx);
+        if (target_keys == NULL && PyErr_Occurred()) {
+            Py_DECREF(key);
+            return -1;
+        }
+        int append_rc = append_to_list(target_keys, key, "data['keys'] must be a list");
+        Py_XDECREF(target_keys);
+        if (append_rc < 0) {
             Py_DECREF(key);
             return -1;
         }
@@ -2177,14 +2398,14 @@ handle_key(ParseContext *ctx, const char *val, size_t val_len)
 
     ctx->last_key_val_ptr = val;
     ctx->last_key_val_len = val_len;
-    pyobj_replace(&ctx->last_key_dict, key);
+    replace_owned_ref(&ctx->last_key_dict, key);
     return 0;
 }
 
 static int
 handle_byterange(ParseContext *ctx, const char *val, size_t val_len)
 {
-    PyObject *segment = materialize_segment(ctx);
+    PyObject *segment = ensure_segment_borrowed(ctx);
     if (segment == NULL) {
         return -1;
     }
@@ -2204,7 +2425,7 @@ handle_byterange(ParseContext *ctx, const char *val, size_t val_len)
 static int
 handle_bitrate(ParseContext *ctx, const char *val, size_t val_len)
 {
-    PyObject *segment = materialize_segment(ctx);
+    PyObject *segment = ensure_segment_borrowed(ctx);
     if (segment == NULL) {
         return -1;
     }
@@ -2245,7 +2466,7 @@ handle_stream_inf(ParseContext *ctx, const char *val, size_t val_len)
     if (stream_info == NULL) {
         return -1;
     }
-    pyobj_replace(&ctx->stream_info, stream_info);
+    replace_owned_ref(&ctx->stream_info, stream_info);
     return 0;
 }
 
@@ -2261,10 +2482,10 @@ handle_stream_inf_with_uri(ParseContext *ctx, const char *val, size_t val_len,
         return -1;
     }
 
-    PyObject *uri = dict_get_interned(info, ms->str_uri);
+    PyObject *uri = dict_get_borrowed(info, ms->str_uri);
     if (uri == NULL) {
         Py_DECREF(info);
-        return 0;
+        return PyErr_Occurred() ? -1 : 0;
     }
     Py_INCREF(uri);
     if (PyDict_DelItem(info, ms->str_uri) < 0) {
@@ -2348,24 +2569,21 @@ handle_part(ParseContext *ctx, const char *val, size_t val_len)
             Py_DECREF(part);
             return -1;
         }
-        PyObject *duration = dict_get_interned(part, ms->str_duration);
+        PyObject *duration = dict_get_owned(part, ms->str_duration);
+        if (duration == NULL && PyErr_Occurred()) {
+            Py_DECREF(part);
+            return -1;
+        }
         if (duration != NULL) {
             double secs = PyFloat_AsDouble(duration);
+            Py_DECREF(duration);
             if (secs == -1.0 && PyErr_Occurred()) {
                 Py_DECREF(part);
                 return -1;
             }
-            if (isfinite(secs) && fabs(secs) < 1e12) {
-                ctx->has_pending_pdt_add = 1;
-                ctx->pending_pdt_secs = secs;
-            } else {
-                PyObject *new_pdt = datetime_add_seconds(
-                    ctx, ctx->current_program_date_time, secs);
-                if (new_pdt == NULL) {
-                    Py_DECREF(part);
-                    return -1;
-                }
-                pyobj_replace(&ctx->current_program_date_time, new_pdt);
+            if (advance_pdt(ctx, secs) < 0) {
+                Py_DECREF(part);
+                return -1;
             }
         }
     }
@@ -2385,13 +2603,13 @@ handle_part(ParseContext *ctx, const char *val, size_t val_len)
     }
     ctx->seg_flags &= ~SEG_FLAG_GAP;
 
-    PyObject *segment = materialize_segment(ctx);
+    PyObject *segment = ensure_segment_borrowed(ctx);
     if (segment == NULL) {
         Py_DECREF(part);
         return -1;
     }
 
-    PyObject *parts = dict_get_interned(segment, ms->str_parts);
+    PyObject *parts = dict_get_borrowed(segment, ms->str_parts);
     if (parts == NULL) {
         if (PyErr_Occurred()) {
             Py_DECREF(part);
@@ -2439,16 +2657,28 @@ handle_cue_out(ParseContext *ctx, const char *line, size_t line_len,
         return -1;
     }
 
-    PyObject *cue_out_scte35 = dict_get_interned(cue_info, ms->str_cue);
-    PyObject *cue_out_duration = dict_get_interned(cue_info, ms->str_duration);
+    PyObject *cue_out_scte35 = dict_get_borrowed(cue_info, ms->str_cue);
+    if (cue_out_scte35 == NULL && PyErr_Occurred()) {
+        Py_DECREF(cue_info);
+        return -1;
+    }
+    PyObject *cue_out_duration = dict_get_borrowed(cue_info, ms->str_duration);
     if (cue_out_duration == NULL) {
-        cue_out_duration = dict_get_interned(cue_info, ms->str_empty);
+        if (PyErr_Occurred()) {
+            Py_DECREF(cue_info);
+            return -1;
+        }
+        cue_out_duration = dict_get_borrowed(cue_info, ms->str_empty);
+        if (cue_out_duration == NULL && PyErr_Occurred()) {
+            Py_DECREF(cue_info);
+            return -1;
+        }
     }
 
     if (cue_out_scte35 != NULL) {
-        pyobj_replace(&ctx->current_cue_out_scte35, Py_NewRef(cue_out_scte35));
+        replace_owned_ref(&ctx->current_cue_out_scte35, Py_NewRef(cue_out_scte35));
     }
-    pyobj_replace(&ctx->current_cue_out_duration, Py_XNewRef(cue_out_duration));
+    replace_owned_ref(&ctx->current_cue_out_duration, Py_XNewRef(cue_out_duration));
 
     Py_DECREF(cue_info);
     return 0;
@@ -2470,7 +2700,11 @@ handle_cue_out_cont(ParseContext *ctx, int has_colon, const char *val, size_t va
         return -1;
     }
 
-    PyObject *progress = dict_get_interned(cue_info, ms->str_empty);
+    PyObject *progress = dict_get_borrowed(cue_info, ms->str_empty);
+    if (progress == NULL && PyErr_Occurred()) {
+        Py_DECREF(cue_info);
+        return -1;
+    }
     if (progress != NULL) {
         if (!PyUnicode_Check(progress)) {
             PyErr_SetString(PyExc_TypeError, "expected str for cue-out progress");
@@ -2478,36 +2712,59 @@ handle_cue_out_cont(ParseContext *ctx, int has_colon, const char *val, size_t va
             return -1;
         }
         Py_ssize_t n = PyUnicode_GetLength(progress);
+        if (n < 0) {
+            Py_DECREF(cue_info);
+            return -1;
+        }
         Py_ssize_t slash = PyUnicode_FindChar(progress, '/', 0, n, 1);
+        if (slash == -2) {
+            Py_DECREF(cue_info);
+            return -1;
+        }
         if (slash >= 0) {
             PyObject *elapsed = PyUnicode_Substring(progress, 0, slash);
-            PyObject *duration = PyUnicode_Substring(progress, slash + 1, n);
-            if (elapsed == NULL || duration == NULL) {
-                Py_XDECREF(elapsed);
-                Py_XDECREF(duration);
+            if (elapsed == NULL) {
                 Py_DECREF(cue_info);
                 return -1;
             }
-            pyobj_replace(&ctx->current_cue_out_elapsedtime, elapsed);
-            pyobj_replace(&ctx->current_cue_out_duration, duration);
+            PyObject *duration = PyUnicode_Substring(progress, slash + 1, n);
+            if (duration == NULL) {
+                Py_DECREF(elapsed);
+                Py_DECREF(cue_info);
+                return -1;
+            }
+            replace_owned_ref(&ctx->current_cue_out_elapsedtime, elapsed);
+            replace_owned_ref(&ctx->current_cue_out_duration, duration);
         } else {
-            pyobj_replace(&ctx->current_cue_out_duration, Py_NewRef(progress));
+            replace_owned_ref(&ctx->current_cue_out_duration, Py_NewRef(progress));
         }
     }
 
-    PyObject *duration = dict_get_interned(cue_info, ms->str_duration);
+    PyObject *duration = dict_get_borrowed(cue_info, ms->str_duration);
+    if (duration == NULL && PyErr_Occurred()) {
+        Py_DECREF(cue_info);
+        return -1;
+    }
     if (duration != NULL) {
-        pyobj_replace(&ctx->current_cue_out_duration, Py_NewRef(duration));
+        replace_owned_ref(&ctx->current_cue_out_duration, Py_NewRef(duration));
     }
 
-    PyObject *scte35 = dict_get_interned(cue_info, ms->str_scte35);
+    PyObject *scte35 = dict_get_borrowed(cue_info, ms->str_scte35);
+    if (scte35 == NULL && PyErr_Occurred()) {
+        Py_DECREF(cue_info);
+        return -1;
+    }
     if (scte35 != NULL) {
-        pyobj_replace(&ctx->current_cue_out_scte35, Py_NewRef(scte35));
+        replace_owned_ref(&ctx->current_cue_out_scte35, Py_NewRef(scte35));
     }
 
-    PyObject *elapsedtime = dict_get_interned(cue_info, ms->str_elapsedtime);
+    PyObject *elapsedtime = dict_get_borrowed(cue_info, ms->str_elapsedtime);
+    if (elapsedtime == NULL && PyErr_Occurred()) {
+        Py_DECREF(cue_info);
+        return -1;
+    }
     if (elapsedtime != NULL) {
-        pyobj_replace(&ctx->current_cue_out_elapsedtime, Py_NewRef(elapsedtime));
+        replace_owned_ref(&ctx->current_cue_out_elapsedtime, Py_NewRef(elapsedtime));
     }
 
     Py_DECREF(cue_info);
@@ -2521,9 +2778,9 @@ handle_oatcls_scte35(ParseContext *ctx, const char *val, size_t val_len)
     if (py_value == NULL) {
         return -1;
     }
-    pyobj_replace(&ctx->current_cue_out_oatcls_scte35, Py_NewRef(py_value));
+    replace_owned_ref(&ctx->current_cue_out_oatcls_scte35, Py_NewRef(py_value));
     if (ctx->current_cue_out_scte35 == NULL) {
-        pyobj_replace(&ctx->current_cue_out_scte35, py_value);
+        replace_owned_ref(&ctx->current_cue_out_scte35, py_value);
     } else {
         Py_DECREF(py_value);
     }
@@ -2538,7 +2795,7 @@ handle_asset(ParseContext *ctx, const char *val, size_t val_len)
     if (asset == NULL) {
         return -1;
     }
-    pyobj_replace(&ctx->asset_metadata, asset);
+    replace_owned_ref(&ctx->asset_metadata, asset);
     return 0;
 }
 
@@ -2551,7 +2808,7 @@ handle_map(ParseContext *ctx, const char *val, size_t val_len)
     if (map_info == NULL) {
         return -1;
     }
-    pyobj_replace(&ctx->current_segment_map, Py_NewRef(map_info));
+    replace_owned_ref(&ctx->current_segment_map, Py_NewRef(map_info));
     int rc = append_to_data_list(ctx, ms->str_segment_map, map_info, "data['segment_map'] must be a list");
     Py_DECREF(map_info);
     return rc;
@@ -2599,9 +2856,9 @@ handle_blackout(ParseContext *ctx, int has_colon, const char *val, size_t val_le
         if (blackout_data == NULL) {
             return -1;
         }
-        pyobj_replace(&ctx->blackout, blackout_data);
+        replace_owned_ref(&ctx->blackout, blackout_data);
     } else {
-        pyobj_replace(&ctx->blackout, Py_NewRef(Py_True));
+        replace_owned_ref(&ctx->blackout, Py_NewRef(Py_True));
     }
     return 0;
 }
@@ -2867,16 +3124,26 @@ dispatch_tag(ParseContext *ctx, const char *line, size_t line_len)
 static PyObject *
 m3u8_parse(PyObject *module, PyObject *args, PyObject *kwargs)
 {
-    const char *content;
-    Py_ssize_t content_len;
+    PyObject *content_obj;
     int strict = 0;
     PyObject *custom_tags_parser = Py_None;
 
     static char *kwlist[] = {"content", "strict", "custom_tags_parser", NULL};
 
-    if (!PyArg_ParseTupleAndKeywords(args, kwargs, "s#|pO", kwlist,
-                                     &content, &content_len, &strict, &custom_tags_parser))
+    if (!PyArg_ParseTupleAndKeywords(args, kwargs, "O|pO", kwlist,
+                                     &content_obj, &strict, &custom_tags_parser))
     {
+        return NULL;
+    }
+
+    if (!PyUnicode_Check(content_obj)) {
+        PyErr_SetString(PyExc_TypeError, "content must be str");
+        return NULL;
+    }
+
+    Py_ssize_t content_len;
+    const char *content = PyUnicode_AsUTF8AndSize(content_obj, &content_len);
+    if (content == NULL) {
         return NULL;
     }
 
@@ -2924,7 +3191,12 @@ m3u8_parse(PyObject *module, PyObject *args, PyObject *kwargs)
         if (errors == NULL) {
             return NULL;
         }
-        if (PyList_Size(errors) > 0) {
+        int has_errors = PyObject_IsTrue(errors);
+        if (has_errors < 0) {
+            Py_DECREF(errors);
+            return NULL;
+        }
+        if (has_errors) {
             PyErr_SetObject(PyExc_Exception, errors);
             Py_DECREF(errors);
             return NULL;
@@ -2943,18 +3215,28 @@ m3u8_parse(PyObject *module, PyObject *args, PyObject *kwargs)
     memset(&ctx, 0, sizeof(ctx));
     ctx.mod_state = mod_state;
     ctx.data = data;
-    ctx.segments_list = dict_get_interned(data, mod_state->str_segments);
-    ctx.keys_list = dict_get_interned(data, mod_state->str_keys);
+    ctx.has_custom_parser = has_custom_parser;
+    ctx.segments_list = Py_XNewRef(dict_get_borrowed(data, mod_state->str_segments));
+    ctx.keys_list = Py_XNewRef(dict_get_borrowed(data, mod_state->str_keys));
     ctx.strict = strict;
 
-    /* Single SIMD upfront check for CR so common LF-only playlists need only one memchr/line */
-    int has_cr = (trimmed_len > 0 && memchr(trimmed, '\r', trimmed_len) != NULL);
+    /*
+     * Single SIMD upfront check for CR so common LF-only playlists need only
+     * one memchr/line. When CR is present, cache next_cr / next_nl so CR-only
+     * and CRLF playlists both scan in strictly O(n) time.
+     */
+    const char *next_cr = (trimmed_len > 0) ? memchr(trimmed, '\r', trimmed_len) : NULL;
+    const char *next_nl = (next_cr != NULL) ? memchr(trimmed, '\n', trimmed_len) : NULL;
+    int has_cr = (next_cr != NULL);
 
     const char *p = trimmed;
     const char *end = trimmed + trimmed_len;
 
     while (p < end) {
         ctx.lineno++;
+        if ((ctx.lineno & 1023) == 0 && PyErr_CheckSignals() < 0) {
+            goto fail;
+        }
 
         const char *line_start = p;
         const char *eol;
@@ -2969,19 +3251,21 @@ m3u8_parse(PyObject *module, PyObject *args, PyObject *kwargs)
                 p = eol + 1;
             }
         } else {
-            const char *nl = memchr(p, '\n', remaining);
-            size_t search_len = nl ? (size_t)(nl - p) : remaining;
-            const char *cr = memchr(p, '\r', search_len);
-            if (cr != NULL) {
-                eol = cr;
-                if (cr + 1 < end && *(cr + 1) == '\n') {
-                    p = cr + 2;
-                } else {
-                    p = cr + 1;
+            if (next_cr != NULL && next_cr < p) {
+                next_cr = memchr(p, '\r', remaining);
+            }
+            if (next_nl != NULL && next_nl < p) {
+                next_nl = memchr(p, '\n', remaining);
+            }
+            if (next_cr != NULL && (next_nl == NULL || next_cr < next_nl)) {
+                eol = next_cr;
+                p = next_cr + 1;
+                if (p < end && *p == '\n') {
+                    p++;
                 }
-            } else if (nl != NULL) {
-                eol = nl;
-                p = nl + 1;
+            } else if (next_nl != NULL) {
+                eol = next_nl;
+                p = next_nl + 1;
             } else {
                 eol = end;
                 p = end;
@@ -3009,10 +3293,12 @@ m3u8_parse(PyObject *module, PyObject *args, PyObject *kwargs)
                     goto fail;
                 }
                 PyObject *py_line = PyUnicode_FromStringAndSize(line_start, (Py_ssize_t)line_len);
-                PyObject *py_lineno = PyLong_FromLong(ctx.lineno);
-                if (py_line == NULL || py_lineno == NULL) {
-                    Py_XDECREF(py_line);
-                    Py_XDECREF(py_lineno);
+                if (py_line == NULL) {
+                    goto fail;
+                }
+                PyObject *py_lineno = PyLong_FromSsize_t(ctx.lineno);
+                if (py_lineno == NULL) {
+                    Py_DECREF(py_line);
                     goto fail;
                 }
                 PyObject *result = PyObject_CallFunctionObjArgs(
@@ -3060,11 +3346,17 @@ m3u8_parse(PyObject *module, PyObject *args, PyObject *kwargs)
     }
 
     /* Handle remaining partial segment at EOF */
-    if (ctx.has_extinf && materialize_segment(&ctx) == NULL) {
+    if (ctx.has_extinf && ensure_segment_borrowed(&ctx) == NULL) {
         goto fail;
     }
     if (ctx.segment != NULL) {
-        if (append_to_list(ctx.segments_list, ctx.segment, "data['segments'] must be a list") < 0) {
+        PyObject *segments = get_segments_list_owned(&ctx);
+        if (segments == NULL && PyErr_Occurred()) {
+            goto fail;
+        }
+        int append_rc = append_to_list(segments, ctx.segment, "data['segments'] must be a list");
+        Py_XDECREF(segments);
+        if (append_rc < 0) {
             goto fail;
         }
     }
@@ -3119,7 +3411,10 @@ static PyMethodDef m3u8_parser_methods[] = {
 static int
 m3u8_parser_traverse(PyObject *module, visitproc visit, void *arg)
 {
-    m3u8_state *state = get_m3u8_state(module);
+    m3u8_state *state = (m3u8_state *)PyModule_GetState(module);
+    if (state == NULL) {
+        return 0;
+    }
     Py_VISIT(state->ParseError);
     Py_VISIT(state->datetime_cls);
     Py_VISIT(state->timedelta_cls);
@@ -3136,7 +3431,10 @@ m3u8_parser_traverse(PyObject *module, visitproc visit, void *arg)
 static int
 m3u8_parser_clear(PyObject *module)
 {
-    m3u8_state *state = get_m3u8_state(module);
+    m3u8_state *state = (m3u8_state *)PyModule_GetState(module);
+    if (state == NULL) {
+        return 0;
+    }
     Py_CLEAR(state->ParseError);
     Py_CLEAR(state->datetime_cls);
     Py_CLEAR(state->timedelta_cls);
@@ -3156,12 +3454,58 @@ m3u8_parser_free(void *module)
     m3u8_parser_clear((PyObject *)module);
 }
 
+static int
+m3u8_parser_exec(PyObject *m)
+{
+    m3u8_state *state = get_m3u8_state(m);
+
+    /*
+     * Import ParseError from openm3u8.parser so both parsers share a single
+     * exception class. openm3u8.parser does not import _m3u8_parser (the graph
+     * is acyclic), and failing loudly prevents silently minting an incompatible
+     * duplicate ParseError if an import error ever occurs.
+     */
+    PyObject *parser_module = PyImport_ImportModule("openm3u8.parser");
+    if (parser_module == NULL) {
+        return -1;
+    }
+    state->ParseError = PyObject_GetAttrString(parser_module, "ParseError");
+    Py_DECREF(parser_module);
+    if (state->ParseError == NULL) {
+        return -1;
+    }
+
+    if (PyModule_AddObjectRef(m, "ParseError", state->ParseError) < 0) {
+        return -1;
+    }
+
+    /* Intern strings first so init_cached_objects can populate segment_template */
+    if (init_interned_strings(state) < 0) {
+        return -1;
+    }
+
+    if (init_cached_objects(state) < 0) {
+        return -1;
+    }
+
+    return 0;
+}
+
+static PyModuleDef_Slot m3u8_parser_slots[] = {
+    {Py_mod_exec, m3u8_parser_exec},
+#ifdef Py_mod_multiple_interpreters
+    {Py_mod_multiple_interpreters, Py_MOD_PER_INTERPRETER_GIL_SUPPORTED},
+#endif
+    {0, NULL}
+};
+
 static struct PyModuleDef m3u8_parser_module = {
     PyModuleDef_HEAD_INIT,
     .m_name = "_m3u8_parser",
     .m_doc = "C extension for fast M3U8 playlist parsing.",
     .m_size = sizeof(m3u8_state),
     .m_methods = m3u8_parser_methods,
+    .m_slots = m3u8_parser_slots,
     .m_traverse = m3u8_parser_traverse,
     .m_clear = m3u8_parser_clear,
     .m_free = m3u8_parser_free,
@@ -3170,45 +3514,5 @@ static struct PyModuleDef m3u8_parser_module = {
 PyMODINIT_FUNC
 PyInit__m3u8_parser(void)
 {
-    PyObject *m = PyModule_Create(&m3u8_parser_module);
-    if (m == NULL) {
-        return NULL;
-    }
-
-    m3u8_state *state = get_m3u8_state(m);
-    memset(state, 0, sizeof(*state));
-
-    PyObject *parser_module = PyImport_ImportModule("openm3u8.parser");
-    if (parser_module != NULL) {
-        state->ParseError = PyObject_GetAttrString(parser_module, "ParseError");
-        Py_DECREF(parser_module);
-    }
-
-    if (state->ParseError == NULL) {
-        PyErr_Clear();
-        state->ParseError = PyErr_NewException(
-            "openm3u8._m3u8_parser.ParseError", PyExc_Exception, NULL);
-        if (state->ParseError == NULL) {
-            goto error;
-        }
-    }
-
-    if (PyModule_AddObjectRef(m, "ParseError", state->ParseError) < 0) {
-        goto error;
-    }
-
-    /* Intern strings first so init_cached_objects can populate segment_template */
-    if (init_interned_strings(state) < 0) {
-        goto error;
-    }
-
-    if (init_cached_objects(state) < 0) {
-        goto error;
-    }
-
-    return m;
-
-error:
-    Py_DECREF(m);
-    return NULL;
+    return PyModuleDef_Init(&m3u8_parser_module);
 }
