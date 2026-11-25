@@ -351,3 +351,60 @@ class CExtensionParityTests(TestCase):
             py_parser.parse(content, strict=True)
         with self.assertRaises(py_parser.ParseError):
             c_parser.parse(content, strict=True)
+
+    def test_custom_tags_parser_mutating_data_lists_raises_typeerror(self):
+        cases = [
+            ("segments", "#EXTM3U\n#EXTINF:1,\nfile.ts"),
+            ("playlists", "#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=100\nlow.m3u8"),
+            ("media", '#EXTM3U\n#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="g",NAME="n"'),
+            ("segment_map", '#EXTM3U\n#EXT-X-MAP:URI="init.mp4"'),
+            ("session_keys", '#EXTM3U\n#EXT-X-SESSION-KEY:METHOD=AES-128,URI="k"'),
+        ]
+        for key, content in cases:
+            for bad_val in (None, ()):
+                with self.subTest(key=key, bad_val=bad_val):
+
+                    def mutator(line, lineno, data, state, k=key, v=bad_val):
+                        if lineno == 1:
+                            if v is None:
+                                data.pop(k, None)
+                            else:
+                                data[k] = v
+                        return False
+
+                    with self.assertRaises(TypeError):
+                        c_parser.parse(content, custom_tags_parser=mutator)
+
+    def test_custom_tags_parser_invalid_state_types_raise_typeerror(self):
+        def bad_segment(line, lineno, data, state):
+            if lineno == 1:
+                state["segment"] = 123
+            return False
+
+        with self.assertRaises(TypeError):
+            c_parser.parse(
+                "#EXTM3U\n#EXTINF:1,\nfile.ts", custom_tags_parser=bad_segment
+            )
+
+        def bad_dateranges(line, lineno, data, state):
+            if lineno == 1:
+                state["dateranges"] = ()
+            return False
+
+        with self.assertRaises(TypeError):
+            c_parser.parse(
+                '#EXTM3U\n#EXT-X-DATERANGE:ID="1",START-DATE="2026-01-01T00:00:00Z"',
+                custom_tags_parser=bad_dateranges,
+            )
+
+    def test_non_finite_bandwidth_falls_back_to_string(self):
+        content = (
+            "#EXTM3U\n"
+            "#EXT-X-STREAM-INF:BANDWIDTH=inf\n"
+            "a.m3u8\n"
+            '#EXT-X-STREAM-INF:BANDWIDTH="nan"\n'
+            "b.m3u8\n"
+        )
+        result = c_parser.parse(content)
+        self.assertEqual(result["playlists"][0]["stream_info"]["bandwidth"], "inf")
+        self.assertEqual(result["playlists"][1]["stream_info"]["bandwidth"], "nan")

@@ -564,17 +564,47 @@ dict_set_interned(PyObject *dict, PyObject *interned_key, PyObject *value)
 static inline PyObject *
 dict_get_interned(PyObject *dict, PyObject *interned_key)
 {
-    return PyDict_GetItem(dict, interned_key);
+    return PyDict_GetItemWithError(dict, interned_key);
 }
 
-static inline void
+static inline int
 dict_del_if_present(PyObject *dict, PyObject *interned_key)
 {
-    if (PyDict_GetItem(dict, interned_key) != NULL) {
-        if (PyDict_DelItem(dict, interned_key) < 0) {
-            PyErr_Clear();
-        }
+    /* Probe first: in sync_ctx_to_state_dict most optional keys are absent, so
+     * avoiding PyDict_DelItem on misses avoids ~15 KeyError allocations/line. */
+    PyObject *existing = PyDict_GetItemWithError(dict, interned_key);
+    if (existing == NULL) {
+        return PyErr_Occurred() ? -1 : 0;
     }
+    if (PyDict_DelItem(dict, interned_key) < 0) {
+        if (PyErr_ExceptionMatches(PyExc_KeyError)) {
+            PyErr_Clear();
+            return 0;
+        }
+        return -1;
+    }
+    return 0;
+}
+
+static inline int
+append_to_list(PyObject *list, PyObject *item, const char *err_msg)
+{
+    if (list == NULL || !PyList_Check(list)) {
+        PyErr_SetString(PyExc_TypeError, err_msg);
+        return -1;
+    }
+    return PyList_Append(list, item);
+}
+
+static inline int
+append_to_data_list(ParseContext *ctx, PyObject *list_key, PyObject *item,
+                    const char *err_msg)
+{
+    PyObject *list = dict_get_interned(ctx->data, list_key);
+    if (list == NULL && PyErr_Occurred()) {
+        return -1;
+    }
+    return append_to_list(list, item, err_msg);
 }
 
 static inline m3u8_state *
@@ -867,7 +897,7 @@ sync_ctx_to_state_dict(ParseContext *ctx)
             if (ctx->seg_flags & (bit)) { \
                 if (dict_set_interned(st, ms->key_field, Py_True) < 0) return -1; \
             } else { \
-                dict_del_if_present(st, ms->key_field); \
+                if (dict_del_if_present(st, ms->key_field) < 0) return -1; \
             } \
         } while (0)
 
@@ -884,7 +914,7 @@ sync_ctx_to_state_dict(ParseContext *ctx)
             if (ctx->field != NULL) { \
                 if (dict_set_interned(st, ms->key_field, ctx->field) < 0) return -1; \
             } else { \
-                dict_del_if_present(st, ms->key_field); \
+                if (dict_del_if_present(st, ms->key_field) < 0) return -1; \
             } \
         } while (0)
 
@@ -920,6 +950,8 @@ sync_state_dict_to_ctx(ParseContext *ctx)
         truth = PyObject_IsTrue(val);
         if (truth < 0) return -1;
         ctx->expect_segment = truth;
+    } else if (PyErr_Occurred()) {
+        return -1;
     } else {
         ctx->expect_segment = 0;
     }
@@ -929,6 +961,8 @@ sync_state_dict_to_ctx(ParseContext *ctx)
         truth = PyObject_IsTrue(val);
         if (truth < 0) return -1;
         ctx->expect_playlist = truth;
+    } else if (PyErr_Occurred()) {
+        return -1;
     } else {
         ctx->expect_playlist = 0;
     }
@@ -941,6 +975,8 @@ sync_state_dict_to_ctx(ParseContext *ctx)
                 truth = PyObject_IsTrue(val); \
                 if (truth < 0) return -1; \
                 if (truth) ctx->seg_flags |= (bit); \
+            } else if (PyErr_Occurred()) { \
+                return -1; \
             } \
         } while (0)
 
@@ -955,7 +991,10 @@ sync_state_dict_to_ctx(ParseContext *ctx)
     #define SYNC_OBJ_FROM_DICT(field, key_field, none_is_null) \
         do { \
             val = dict_get_interned(st, ms->key_field); \
-            if (val == NULL || ((none_is_null) && val == Py_None)) { \
+            if (val == NULL) { \
+                if (PyErr_Occurred()) return -1; \
+                pyobj_replace(&ctx->field, NULL); \
+            } else if ((none_is_null) && val == Py_None) { \
                 pyobj_replace(&ctx->field, NULL); \
             } else { \
                 pyobj_replace(&ctx->field, Py_NewRef(val)); \
@@ -963,6 +1002,10 @@ sync_state_dict_to_ctx(ParseContext *ctx)
         } while (0)
 
     SYNC_OBJ_FROM_DICT(segment, str_segment, 0);
+    if (ctx->segment != NULL && !PyDict_Check(ctx->segment)) {
+        PyErr_SetString(PyExc_TypeError, "state['segment'] must be a dict");
+        return -1;
+    }
     SYNC_OBJ_FROM_DICT(program_date_time, str_program_date_time, 1);
     SYNC_OBJ_FROM_DICT(current_program_date_time, str_current_program_date_time, 1);
     SYNC_OBJ_FROM_DICT(current_key, str_current_key, 1);
@@ -979,7 +1022,9 @@ sync_state_dict_to_ctx(ParseContext *ctx)
 
     /* Invalidate cached data pointers/caches in case callback mutated data */
     ctx->segments_list = dict_get_interned(ctx->data, ms->str_segments);
+    if (ctx->segments_list == NULL && PyErr_Occurred()) return -1;
     ctx->keys_list = dict_get_interned(ctx->data, ms->str_keys);
+    if (ctx->keys_list == NULL && PyErr_Occurred()) return -1;
     ctx->keys_has_none = 0;
     ctx->last_key_val_ptr = NULL;
     ctx->last_key_val_len = 0;
@@ -1329,7 +1374,7 @@ parse_attributes_with_schema(m3u8_state *ms, const char *start, const char *end,
                     }
                 } else if (type == ATTR_BANDWIDTH) {
                     double v;
-                    if (parse_double_slice(val_start, val_len, &v) == 0) {
+                    if (parse_double_slice(val_start, val_len, &v) == 0 && isfinite(v)) {
                         py_val = PyLong_FromDouble(v);
                     } else {
                         py_val = PyUnicode_FromStringAndSize(val_start, (Py_ssize_t)val_len);
@@ -1365,7 +1410,7 @@ parse_attributes_with_schema(m3u8_state *ms, const char *start, const char *end,
                     }
                 } else if (type == ATTR_BANDWIDTH) {
                     double v;
-                    if (parse_double_slice(val_start, val_len, &v) == 0) {
+                    if (parse_double_slice(val_start, val_len, &v) == 0 && isfinite(v)) {
                         py_val = PyLong_FromDouble(v);
                     } else {
                         py_val = PyUnicode_FromStringAndSize(val_start, (Py_ssize_t)val_len);
@@ -1603,10 +1648,7 @@ static int
 ensure_none_in_keys(ParseContext *ctx)
 {
     PyObject *keys = ctx->keys_list;
-    if (keys == NULL) {
-        return 0;
-    }
-    if (!PyList_Check(keys)) {
+    if (keys == NULL || !PyList_Check(keys)) {
         PyErr_SetString(PyExc_TypeError, "data['keys'] must be a list");
         return -1;
     }
@@ -1909,6 +1951,9 @@ parse_ts_chunk(ParseContext *ctx, const char *line, size_t line_len)
                 goto fail_seg;
             }
             PyObject *duration_obj = dict_get_interned(segment, ms->str_duration);
+            if (duration_obj == NULL && PyErr_Occurred()) {
+                goto fail_seg;
+            }
             if (duration_obj != NULL) {
                 double secs = PyFloat_AsDouble(duration_obj);
                 if (secs == -1.0 && PyErr_Occurred()) {
@@ -1989,11 +2034,9 @@ parse_ts_chunk(ParseContext *ctx, const char *line, size_t line_len)
     ctx->seg_flags = 0;
     ctx->expect_segment = 0;
 
-    if (ctx->segments_list != NULL) {
-        if (PyList_Append(ctx->segments_list, segment) < 0) {
-            Py_DECREF(segment);
-            return -1;
-        }
+    if (append_to_list(ctx->segments_list, segment, "data['segments'] must be a list") < 0) {
+        Py_DECREF(segment);
+        return -1;
     }
     Py_DECREF(segment);
     return 0;
@@ -2041,12 +2084,11 @@ parse_variant_playlist(ParseContext *ctx, const char *line, size_t line_len)
     Py_DECREF(uri);
     Py_DECREF(stream_info);
 
-    PyObject *playlists = dict_get_interned(ctx->data, ms->str_playlists);
-    if (playlists != NULL && PyList_Append(playlists, playlist) < 0) {
-        Py_DECREF(playlist);
+    int rc = append_to_data_list(ctx, ms->str_playlists, playlist, "data['playlists'] must be a list");
+    Py_DECREF(playlist);
+    if (rc < 0) {
         return -1;
     }
-    Py_DECREF(playlist);
 
     ctx->expect_playlist = 0;
     return 0;
@@ -2071,6 +2113,10 @@ handle_program_date_time(ParseContext *ctx, const char *val, size_t val_len)
     }
 
     PyObject *existing = dict_get_interned(ctx->data, ms->str_program_date_time);
+    if (existing == NULL && PyErr_Occurred()) {
+        Py_DECREF(dt);
+        return -1;
+    }
     if (existing == NULL || existing == Py_None) {
         if (dict_set_interned(ctx->data, ms->str_program_date_time, dt) < 0) {
             Py_DECREF(dt);
@@ -2112,17 +2158,20 @@ handle_key(ParseContext *ctx, const char *val, size_t val_len)
     pyobj_replace(&ctx->current_key, Py_NewRef(key));
 
     PyObject *keys = ctx->keys_list;
-    if (keys != NULL) {
-        int found = PySequence_Contains(keys, key);
-        if (found < 0) {
+    if (keys == NULL || !PyList_Check(keys)) {
+        PyErr_SetString(PyExc_TypeError, "data['keys'] must be a list");
+        Py_DECREF(key);
+        return -1;
+    }
+    int found = PySequence_Contains(keys, key);
+    if (found < 0) {
+        Py_DECREF(key);
+        return -1;
+    }
+    if (found == 0) {
+        if (PyList_Append(keys, key) < 0) {
             Py_DECREF(key);
             return -1;
-        }
-        if (found == 0) {
-            if (PyList_Append(keys, key) < 0) {
-                Py_DECREF(key);
-                return -1;
-            }
         }
     }
 
@@ -2242,13 +2291,7 @@ handle_stream_inf_with_uri(ParseContext *ctx, const char *val, size_t val_len,
     Py_DECREF(uri);
     Py_DECREF(info);
 
-    PyObject *list = dict_get_interned(ctx->data, list_key);
-    if (list == NULL || !PyList_Check(list)) {
-        PyErr_SetString(PyExc_TypeError, "playlist target must be a list");
-        Py_DECREF(playlist);
-        return -1;
-    }
-    int rc = PyList_Append(list, playlist);
+    int rc = append_to_data_list(ctx, list_key, playlist, "playlist target must be a list");
     Py_DECREF(playlist);
     return rc;
 }
@@ -2263,8 +2306,7 @@ handle_typed_attr_list(ParseContext *ctx, const char *val, size_t val_len,
     if (result == NULL) {
         return -1;
     }
-    PyObject *list = dict_get_interned(ctx->data, list_key);
-    int rc = PyList_Append(list, result);
+    int rc = append_to_data_list(ctx, list_key, result, "playlist target must be a list");
     Py_DECREF(result);
     return rc;
 }
@@ -2351,6 +2393,10 @@ handle_part(ParseContext *ctx, const char *val, size_t val_len)
 
     PyObject *parts = dict_get_interned(segment, ms->str_parts);
     if (parts == NULL) {
+        if (PyErr_Occurred()) {
+            Py_DECREF(part);
+            return -1;
+        }
         parts = PyList_New(0);
         if (parts == NULL) {
             Py_DECREF(part);
@@ -2361,11 +2407,13 @@ handle_part(ParseContext *ctx, const char *val, size_t val_len)
             Py_DECREF(part);
             return -1;
         }
+        int rc = PyList_Append(parts, part);
         Py_DECREF(parts);
-        parts = dict_get_interned(segment, ms->str_parts);
+        Py_DECREF(part);
+        return rc;
     }
 
-    int rc = PyList_Append(parts, part);
+    int rc = append_to_list(parts, part, "segment['parts'] must be a list");
     Py_DECREF(part);
     return rc;
 }
@@ -2504,8 +2552,7 @@ handle_map(ParseContext *ctx, const char *val, size_t val_len)
         return -1;
     }
     pyobj_replace(&ctx->current_segment_map, Py_NewRef(map_info));
-    PyObject *segment_map = dict_get_interned(ctx->data, ms->str_segment_map);
-    int rc = PyList_Append(segment_map, map_info);
+    int rc = append_to_data_list(ctx, ms->str_segment_map, map_info, "data['segment_map'] must be a list");
     Py_DECREF(map_info);
     return rc;
 }
@@ -2519,8 +2566,7 @@ handle_session_key(ParseContext *ctx, const char *val, size_t val_len)
     if (key == NULL) {
         return -1;
     }
-    PyObject *session_keys = dict_get_interned(ctx->data, ms->str_session_keys);
-    int rc = PyList_Append(session_keys, key);
+    int rc = append_to_data_list(ctx, ms->str_session_keys, key, "data['session_keys'] must be a list");
     Py_DECREF(key);
     return rc;
 }
@@ -2540,7 +2586,7 @@ handle_daterange(ParseContext *ctx, const char *val, size_t val_len)
             return -1;
         }
     }
-    int rc = PyList_Append(ctx->dateranges, daterange);
+    int rc = append_to_list(ctx->dateranges, daterange, "state['dateranges'] must be a list");
     Py_DECREF(daterange);
     return rc;
 }
@@ -3017,8 +3063,8 @@ m3u8_parse(PyObject *module, PyObject *args, PyObject *kwargs)
     if (ctx.has_extinf && materialize_segment(&ctx) == NULL) {
         goto fail;
     }
-    if (ctx.segment != NULL && ctx.segments_list != NULL) {
-        if (PyList_Append(ctx.segments_list, ctx.segment) < 0) {
+    if (ctx.segment != NULL) {
+        if (append_to_list(ctx.segments_list, ctx.segment, "data['segments'] must be a list") < 0) {
             goto fail;
         }
     }
@@ -3147,9 +3193,7 @@ PyInit__m3u8_parser(void)
         }
     }
 
-    Py_INCREF(state->ParseError);
-    if (PyModule_AddObject(m, "ParseError", state->ParseError) < 0) {
-        Py_DECREF(state->ParseError);
+    if (PyModule_AddObjectRef(m, "ParseError", state->ParseError) < 0) {
         goto error;
     }
 
